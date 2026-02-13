@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+
+# Local config
+config.json
+
+# Local runtime DB/state
+mdblist_pmdb.sqlite3
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Local artifacts
+*.log
+logs/
+imdb/
+.DS_Store
+
+# Scratch / source-reference workspace
+temp/

@@ -1,0 +1,120 @@
+{
+  "api_keys": {
+    "tmdb": "YOUR_TMDB_API_KEY",
+    "mdblist": "YOUR_MDBLIST_API_KEY",
+    "pmdb": "pm-YOUR_PUBLICMETADB_API_KEY"
+  },
+  "runtime": {
+    "database_path": "mdblist_pmdb.sqlite3",
+    "log_file_path": "logs/mdblist_pmdb.log",
+    "log_file_max_bytes": 10485760,
+    "log_file_backup_count": 5,
+    "ratings_refresh_days": 7,
+    "harvest_mode": "all",
+    "run_mode": "continuous",
+    "harvester_cycle_sleep_seconds": 30,
+    "submitter_poll_seconds": 0.01,
+    "submitter_workers": 300,
+    "submitter_in_flight_lease_seconds": 300,
+    "submitter_max_retry_attempts": 12,
+    "console_mode": "dashboard",
+    "debug_raw_console_logs": false,
+    "dashboard_event_lines": 8,
+    "dashboard_event_dedupe_window_seconds": 30,
+    "dashboard_event_max_message_length": 160,
+    "log_level": "INFO"
+  },
+  "tmdb": {
+    "base_url": "https://api.themoviedb.org/3",
+    "language": "en-US",
+    "timeout_seconds": 20,
+    "max_retries": 5,
+    "details_concurrency": 10,
+    "rate_limit": {
+      "requests": 45,
+      "per_seconds": 1
+    },
+    "sources": [
+      {
+        "name": "movie/popular",
+        "enabled": true,
+        "max_pages": 500
+      },
+      {
+        "name": "movie/top_rated",
+        "enabled": true,
+        "max_pages": 500
+      },
+      {
+        "name": "tv/popular",
+        "enabled": true,
+        "max_pages": 500
+      },
+      {
+        "name": "tv/top_rated",
+        "enabled": true,
+        "max_pages": 500
+      },
+      {
+        "name": "trending/movie/day",
+        "enabled": true,
+        "max_pages": 500
+      },
+      {
+        "name": "trending/movie/week",
+        "enabled": true,
+        "max_pages": 500
+      },
+      {
+        "name": "trending/tv/day",
+        "enabled": true,
+        "max_pages": 500
+      },
+      {
+        "name": "trending/tv/week",
+        "enabled": true,
+        "max_pages": 500
+      },
+      {
+        "name": "trending/all/day",
+        "enabled": true,
+        "max_pages": 500
+      },
+      {
+        "name": "trending/all/week",
+        "enabled": true,
+        "max_pages": 500
+      }
+    ]
+  },
+  "mdblist": {
+    "base_url": "https://api.mdblist.com",
+    "timeout_seconds": 25,
+    "max_retries": 5,
+    "batch_size": 100,
+    "max_batch_size": 200,
+    "max_pause_block_seconds": 20,
+    "rate_limit": {
+      "requests": 1,
+      "per_seconds": 1
+    },
+    "append_to_response": []
+  },
+  "pmdb": {
+    "base_url": "https://publicmetadb.com",
+    "timeout_seconds": 8,
+    "max_retries": 1,
+    "api_rate_limit": {
+      "requests": 5000,
+      "per_seconds": 1
+    },
+    "ratings_limit": {
+      "requests": 5000,
+      "per_seconds": 1
+    },
+    "mappings_limit": {
+      "requests": 5000,
+      "per_seconds": 1
+    }
+  }
+}
