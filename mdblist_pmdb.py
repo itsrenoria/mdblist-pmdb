@@ -65,6 +65,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "runtime": {
         "database_path": "mdblist_pmdb.sqlite3",
+        "discovery_mode": "source",
+        "daily_title_limit": 100000,
+        "hybrid_source_interval_hours": 24,
         "imdb_archive_path": "imdb",
         "imdb_archive_auto_update_enabled": True,
         "imdb_archive_update_interval_days": 7,
@@ -73,8 +76,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "log_file_max_bytes": 10485760,
         "log_file_backup_count": 5,
         "ratings_refresh_days": 7,
-        "harvest_mode": "all",
-        "run_mode": "continuous",
+        "failed_refresh_days": 7,
         "harvester_cycle_sleep_seconds": 30,
         "submitter_poll_seconds": 2,
         "submitter_workers": 8,
@@ -192,22 +194,116 @@ DEFAULT_IMDB_TITLE_TYPES: Tuple[str, ...] = (
 )
 IMDB_TITLE_ID_RE = re.compile(r"^tt[0-9]+$")
 
-SUPPORTED_HARVEST_MODES: Set[str] = {
-    "new_only",
-    "failed_only",
-    "ttl_only",
-    "all",
-}
-
-SUPPORTED_RUN_MODES: Set[str] = {
-    "continuous",
-    "once",
-    "until_idle",
+SUPPORTED_DISCOVERY_MODES: Set[str] = {
+    "source",
+    "local",
+    "hybrid",
 }
 
 SUPPORTED_CONSOLE_MODES: Set[str] = {
     "dashboard",
     "raw",
+}
+
+HARVEST_REASON_ORDER: Tuple[str, ...] = ("failed", "new", "ttl")
+
+SUPPORTED_LOG_LEVELS: Set[str] = {
+    "DEBUG",
+    "INFO",
+    "WARNING",
+    "ERROR",
+    "CRITICAL",
+}
+
+CONFIG_TOP_LEVEL_KEYS: Set[str] = {
+    "api_keys",
+    "runtime",
+    "tmdb",
+    "mdblist",
+    "pmdb",
+}
+
+CONFIG_API_KEYS_KEYS: Set[str] = {
+    "tmdb",
+    "mdblist",
+    "pmdb",
+}
+
+CONFIG_RUNTIME_KEYS: Set[str] = {
+    "database_path",
+    "discovery_mode",
+    "daily_title_limit",
+    "hybrid_source_interval_hours",
+    "imdb_archive_path",
+    "imdb_archive_auto_update_enabled",
+    "imdb_archive_update_interval_days",
+    "imdb_archive_download_timeout_seconds",
+    "log_file_path",
+    "log_file_max_bytes",
+    "log_file_backup_count",
+    "ratings_refresh_days",
+    "failed_refresh_days",
+    "harvester_cycle_sleep_seconds",
+    "submitter_poll_seconds",
+    "submitter_workers",
+    "submitter_in_flight_lease_seconds",
+    "submitter_max_retry_attempts",
+    "console_mode",
+    "debug_raw_console_logs",
+    "dashboard_event_lines",
+    "dashboard_event_dedupe_window_seconds",
+    "dashboard_event_max_message_length",
+    "log_level",
+}
+
+CONFIG_TMDB_KEYS: Set[str] = {
+    "base_url",
+    "language",
+    "timeout_seconds",
+    "max_retries",
+    "details_concurrency",
+    "rate_limit",
+    "sources",
+}
+
+CONFIG_MDBLIST_KEYS: Set[str] = {
+    "base_url",
+    "timeout_seconds",
+    "max_retries",
+    "batch_size",
+    "max_batch_size",
+    "max_pause_block_seconds",
+    "rate_limit",
+    "append_to_response",
+}
+
+CONFIG_PMDB_KEYS: Set[str] = {
+    "base_url",
+    "timeout_seconds",
+    "max_retries",
+    "api_rate_limit",
+    "ratings_limit",
+    "mappings_limit",
+}
+
+CONFIG_RATE_LIMIT_KEYS: Set[str] = {
+    "requests",
+    "per_seconds",
+}
+
+CONFIG_TMDB_SOURCE_KEYS: Set[str] = {
+    "name",
+    "enabled",
+    "max_pages",
+}
+
+CONFIG_IMDB_SOURCE_KEYS: Set[str] = {
+    "name",
+    "enabled",
+    "min_votes",
+    "types",
+    "exclude_unknown_year",
+    "max_titles_per_cycle",
 }
 
 HARVEST_CHECKPOINT_KEY = "harvester_checkpoint_v1"
@@ -220,6 +316,9 @@ IMDB_ARCHIVE_EXHAUSTED_KEY = "imdb_archive_exhausted_v1"
 IMDB_ARCHIVE_LAST_UPDATE_KEY = "imdb_archive_last_update_v1"
 IMDB_ARCHIVE_LAST_UPDATE_ATTEMPT_KEY = "imdb_archive_last_update_attempt_v1"
 IMDB_ARCHIVE_RETRY_COOLDOWN_SECONDS = 21600  # 6 hours
+DISCOVERY_DAILY_USED_KEY_PREFIX = "discovery_daily_used_v1:"
+HYBRID_SOURCE_LAST_RUN_KEY = "hybrid_source_last_run_v1"
+LOCAL_CYCLE_METRICS_KEY = "local_cycle_metrics"
 IMDB_ARCHIVE_DATASET_URLS: Dict[str, str] = {
     "title.basics.tsv": "https://datasets.imdbws.com/title.basics.tsv.gz",
     "title.ratings.tsv": "https://datasets.imdbws.com/title.ratings.tsv.gz",
@@ -380,6 +479,29 @@ def merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]
     return result
 
 
+def _warn_unknown_config_keys(
+    mapping: Dict[str, Any], *, context: str, allowed_keys: Set[str]
+) -> None:
+    unknown = sorted(
+        str(key)
+        for key in mapping.keys()
+        if str(key) not in allowed_keys
+    )
+    if not unknown:
+        return
+    dotted = ", ".join(f"{context}.{key}" if context else key for key in unknown)
+    LOGGER.warning("Unknown config key(s) will be ignored: %s", dotted)
+
+
+def _get_loaded_section(loaded: Dict[str, Any], section_name: str) -> Dict[str, Any]:
+    raw_value = loaded.get(section_name, {})
+    if raw_value is None:
+        return {}
+    if not isinstance(raw_value, dict):
+        raise ValueError(f"{section_name} must be an object")
+    return raw_value
+
+
 def load_config(path: Path) -> Dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(
@@ -388,6 +510,97 @@ def load_config(path: Path) -> Dict[str, Any]:
 
     with path.open("r", encoding="utf-8") as handle:
         loaded = json.load(handle)
+
+    if not isinstance(loaded, dict):
+        raise ValueError("Config root must be a JSON object")
+
+    _warn_unknown_config_keys(loaded, context="", allowed_keys=CONFIG_TOP_LEVEL_KEYS)
+    loaded_api_keys = _get_loaded_section(loaded, "api_keys")
+    loaded_runtime = _get_loaded_section(loaded, "runtime")
+    loaded_tmdb = _get_loaded_section(loaded, "tmdb")
+    loaded_mdblist = _get_loaded_section(loaded, "mdblist")
+    loaded_pmdb = _get_loaded_section(loaded, "pmdb")
+
+    _warn_unknown_config_keys(
+        loaded_api_keys,
+        context="api_keys",
+        allowed_keys=CONFIG_API_KEYS_KEYS,
+    )
+    _warn_unknown_config_keys(
+        loaded_runtime,
+        context="runtime",
+        allowed_keys=CONFIG_RUNTIME_KEYS,
+    )
+    _warn_unknown_config_keys(
+        loaded_tmdb,
+        context="tmdb",
+        allowed_keys=CONFIG_TMDB_KEYS,
+    )
+    _warn_unknown_config_keys(
+        loaded_mdblist,
+        context="mdblist",
+        allowed_keys=CONFIG_MDBLIST_KEYS,
+    )
+    _warn_unknown_config_keys(
+        loaded_pmdb,
+        context="pmdb",
+        allowed_keys=CONFIG_PMDB_KEYS,
+    )
+
+    if "rate_limit" in loaded_tmdb:
+        tmdb_rate_limit = loaded_tmdb["rate_limit"]
+        if not isinstance(tmdb_rate_limit, dict):
+            raise ValueError("tmdb.rate_limit must be an object")
+        _warn_unknown_config_keys(
+            tmdb_rate_limit,
+            context="tmdb.rate_limit",
+            allowed_keys=CONFIG_RATE_LIMIT_KEYS,
+        )
+
+    if "rate_limit" in loaded_mdblist:
+        mdblist_rate_limit = loaded_mdblist["rate_limit"]
+        if not isinstance(mdblist_rate_limit, dict):
+            raise ValueError("mdblist.rate_limit must be an object")
+        _warn_unknown_config_keys(
+            mdblist_rate_limit,
+            context="mdblist.rate_limit",
+            allowed_keys=CONFIG_RATE_LIMIT_KEYS,
+        )
+
+    for pmdb_rate_key in ("api_rate_limit", "ratings_limit", "mappings_limit"):
+        if pmdb_rate_key in loaded_pmdb:
+            pmdb_rate_limit = loaded_pmdb[pmdb_rate_key]
+            if not isinstance(pmdb_rate_limit, dict):
+                raise ValueError(f"pmdb.{pmdb_rate_key} must be an object")
+            _warn_unknown_config_keys(
+                pmdb_rate_limit,
+                context=f"pmdb.{pmdb_rate_key}",
+                allowed_keys=CONFIG_RATE_LIMIT_KEYS,
+            )
+
+    if "append_to_response" in loaded_mdblist and not isinstance(
+        loaded_mdblist["append_to_response"], list
+    ):
+        raise ValueError("mdblist.append_to_response must be a list")
+
+    if "sources" in loaded_tmdb:
+        loaded_sources = loaded_tmdb["sources"]
+        if not isinstance(loaded_sources, list):
+            raise ValueError("tmdb.sources must be a list")
+        for idx, source in enumerate(loaded_sources):
+            if not isinstance(source, dict):
+                raise ValueError(f"tmdb.sources[{idx}] must be an object")
+            source_name = str(source.get("name", "")).strip().lower().lstrip("/")
+            source_allowed_keys = (
+                CONFIG_IMDB_SOURCE_KEYS
+                if source_name == IMDB_ARCHIVE_SOURCE_NAME
+                else CONFIG_TMDB_SOURCE_KEYS
+            )
+            _warn_unknown_config_keys(
+                source,
+                context=f"tmdb.sources[{idx}]",
+                allowed_keys=source_allowed_keys,
+            )
 
     config = merge_dict(DEFAULT_CONFIG, loaded)
 
@@ -424,6 +637,25 @@ def load_config(path: Path) -> Dict[str, Any]:
     config["runtime"]["submitter_max_retry_attempts"] = max(
         1, int(config["runtime"].get("submitter_max_retry_attempts", 12))
     )
+    discovery_mode = str(config["runtime"].get("discovery_mode", "source")).strip().lower()
+    if discovery_mode not in SUPPORTED_DISCOVERY_MODES:
+        raise ValueError(
+            "Invalid runtime.discovery_mode. Expected one of: "
+            + ", ".join(sorted(SUPPORTED_DISCOVERY_MODES))
+        )
+    config["runtime"]["discovery_mode"] = discovery_mode
+
+    daily_title_limit = int(config["runtime"].get("daily_title_limit", 100000))
+    if daily_title_limit < 1:
+        raise ValueError("runtime.daily_title_limit must be >= 1")
+    config["runtime"]["daily_title_limit"] = daily_title_limit
+
+    hybrid_source_interval_hours = int(
+        config["runtime"].get("hybrid_source_interval_hours", 24)
+    )
+    if hybrid_source_interval_hours < 1:
+        raise ValueError("runtime.hybrid_source_interval_hours must be >= 1")
+    config["runtime"]["hybrid_source_interval_hours"] = hybrid_source_interval_hours
     log_file_path = str(
         config["runtime"].get("log_file_path", "logs/mdblist_pmdb.log")
     ).strip()
@@ -439,6 +671,10 @@ def load_config(path: Path) -> Dict[str, Any]:
     )
     config["runtime"]["ratings_refresh_days"] = max(
         1, int(config["runtime"]["ratings_refresh_days"])
+    )
+    config["runtime"]["failed_refresh_days"] = max(
+        0,
+        int(config["runtime"].get("failed_refresh_days", 7)),
     )
     config["runtime"]["dashboard_event_lines"] = max(
         3, min(20, int(config["runtime"].get("dashboard_event_lines", 8)))
@@ -465,22 +701,6 @@ def load_config(path: Path) -> Dict[str, Any]:
         30, int(config["runtime"].get("imdb_archive_download_timeout_seconds", 300))
     )
 
-    harvest_mode = str(config["runtime"].get("harvest_mode", "all")).strip().lower()
-    if harvest_mode not in SUPPORTED_HARVEST_MODES:
-        raise ValueError(
-            "Invalid runtime.harvest_mode. Expected one of: "
-            + ", ".join(sorted(SUPPORTED_HARVEST_MODES))
-        )
-    config["runtime"]["harvest_mode"] = harvest_mode
-
-    run_mode = str(config["runtime"].get("run_mode", "continuous")).strip().lower()
-    if run_mode not in SUPPORTED_RUN_MODES:
-        raise ValueError(
-            "Invalid runtime.run_mode. Expected one of: "
-            + ", ".join(sorted(SUPPORTED_RUN_MODES))
-        )
-    config["runtime"]["run_mode"] = run_mode
-
     console_mode = str(config["runtime"].get("console_mode", "dashboard")).strip().lower()
     if console_mode not in SUPPORTED_CONSOLE_MODES:
         raise ValueError(
@@ -488,6 +708,13 @@ def load_config(path: Path) -> Dict[str, Any]:
             + ", ".join(sorted(SUPPORTED_CONSOLE_MODES))
         )
     config["runtime"]["console_mode"] = console_mode
+    log_level = str(config["runtime"].get("log_level", "INFO")).strip().upper()
+    if log_level not in SUPPORTED_LOG_LEVELS:
+        raise ValueError(
+            "Invalid runtime.log_level. Expected one of: "
+            + ", ".join(sorted(SUPPORTED_LOG_LEVELS))
+        )
+    config["runtime"]["log_level"] = log_level
 
     for section, rate_key in (
         ("tmdb", "rate_limit"),
@@ -513,8 +740,10 @@ def load_config(path: Path) -> Dict[str, Any]:
         )
 
     raw_sources = config["tmdb"].get("sources")
-    if not isinstance(raw_sources, list) or not raw_sources:
-        raise ValueError("tmdb.sources must be a non-empty list")
+    if not isinstance(raw_sources, list):
+        raise ValueError("tmdb.sources must be a list")
+    if discovery_mode in {"source", "hybrid"} and not raw_sources:
+        raise ValueError("tmdb.sources must be a non-empty list in source/hybrid discovery_mode")
 
     normalized_tmdb_sources: List[Dict[str, Any]] = []
     normalized_imdb_sources: List[Dict[str, Any]] = []
@@ -584,8 +813,12 @@ def load_config(path: Path) -> Dict[str, Any]:
         raise ValueError("Only one tmdb.sources entry with name='imdb_archive' is supported")
 
     normalized_sources = normalized_tmdb_sources + normalized_imdb_sources
-    if not any(src["enabled"] for src in normalized_sources):
-        raise ValueError("At least one tmdb.sources entry must be enabled")
+    if discovery_mode in {"source", "hybrid"} and not any(
+        src["enabled"] for src in normalized_sources
+    ):
+        raise ValueError(
+            "At least one tmdb.sources entry must be enabled in source/hybrid discovery_mode"
+        )
 
     imdb_enabled = any(
         src["enabled"] and src["name"] == IMDB_ARCHIVE_SOURCE_NAME
@@ -942,6 +1175,24 @@ class LocalDatabase:
                 ON mappings (pmdb_status, pmdb_retry_after)
                 """
             )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_mappings_imdb_lookup
+                ON mappings (id_type, id_value, media_type)
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_titles_imdb_lookup
+                ON titles (imdb_id, media_type)
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_titles_harvest_due
+                ON titles (last_harvested_at, media_type, tmdb_id)
+                """
+            )
 
             # Backward-compatible migrations for existing local DB files.
             self._ensure_column("ratings", "pmdb_item_id", "TEXT")
@@ -1040,39 +1291,169 @@ class LocalDatabase:
                 ),
             )
 
+    @staticmethod
+    def _harvest_reason_case_sql() -> str:
+        return (
+            "CASE "
+            "WHEN TRIM(COALESCE(last_error, '')) <> '' "
+            "     AND ("
+            "            ? <= 0 "
+            "            OR last_harvested_at IS NULL "
+            "            OR ? - last_harvested_at >= ?"
+            "         ) "
+            "THEN 'failed' "
+            "WHEN last_harvested_at IS NULL THEN 'new' "
+            "WHEN last_harvested_at IS NOT NULL "
+            "     AND ? - last_harvested_at >= ? "
+            "THEN 'ttl' "
+            "ELSE '' "
+            "END"
+        )
+
+    @staticmethod
+    def _harvest_reason_case_params(
+        *,
+        now_ts: int,
+        ratings_ttl_seconds: int,
+        failed_retry_seconds: int,
+    ) -> Tuple[int, int, int, int, int]:
+        failed_retry = max(0, int(failed_retry_seconds))
+        return (
+            failed_retry,
+            int(now_ts),
+            failed_retry,
+            int(now_ts),
+            max(1, int(ratings_ttl_seconds)),
+        )
+
+    def local_due_counts(
+        self,
+        *,
+        now_ts: int,
+        ratings_ttl_seconds: int,
+        failed_retry_seconds: int = 0,
+    ) -> Dict[str, int]:
+        reason_case = self._harvest_reason_case_sql()
+        case_params = self._harvest_reason_case_params(
+            now_ts=now_ts,
+            ratings_ttl_seconds=ratings_ttl_seconds,
+            failed_retry_seconds=failed_retry_seconds,
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT harvest_reason, COUNT(*) AS c
+            FROM (
+                SELECT {reason_case} AS harvest_reason
+                FROM titles
+            )
+            WHERE harvest_reason <> ''
+            GROUP BY harvest_reason
+            """,
+            case_params,
+        ).fetchall()
+
+        counts = {"failed": 0, "new": 0, "ttl": 0}
+        for row in rows:
+            reason = str(row["harvest_reason"] or "").strip().lower()
+            if reason in counts:
+                counts[reason] = int((row["c"] if row else 0) or 0)
+
+        return {
+            "failed": counts["failed"],
+            "new": counts["new"],
+            "ttl": counts["ttl"],
+            "total": counts["failed"] + counts["new"] + counts["ttl"],
+        }
+
+    def select_local_due_titles(
+        self,
+        *,
+        now_ts: int,
+        ratings_ttl_seconds: int,
+        limit: int,
+        failed_retry_seconds: int = 0,
+    ) -> List[sqlite3.Row]:
+        safe_limit = max(0, int(limit))
+        if safe_limit <= 0:
+            return []
+
+        reasons = HARVEST_REASON_ORDER
+
+        reason_case = self._harvest_reason_case_sql()
+        case_params = list(
+            self._harvest_reason_case_params(
+                now_ts=now_ts,
+                ratings_ttl_seconds=ratings_ttl_seconds,
+                failed_retry_seconds=failed_retry_seconds,
+            )
+        )
+        reason_placeholders = ", ".join("?" for _ in reasons)
+        params: List[Any] = case_params + list(reasons) + [safe_limit]
+        return self.conn.execute(
+            f"""
+            SELECT
+                tmdb_id,
+                media_type,
+                title,
+                popularity,
+                last_harvested_at,
+                last_error,
+                harvest_reason
+            FROM (
+                SELECT
+                    tmdb_id,
+                    media_type,
+                    title,
+                    popularity,
+                    last_harvested_at,
+                    last_error,
+                    {reason_case} AS harvest_reason
+                FROM titles
+            )
+            WHERE harvest_reason IN ({reason_placeholders})
+            ORDER BY
+                CASE harvest_reason
+                    WHEN 'failed' THEN 0
+                    WHEN 'new' THEN 1
+                    WHEN 'ttl' THEN 2
+                    ELSE 3
+                END,
+                COALESCE(last_harvested_at, 0) ASC,
+                media_type ASC,
+                tmdb_id ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+
     def should_harvest(
         self,
         tmdb_id: int,
         media_type: str,
         now_ts: int,
         ratings_ttl_seconds: int,
-        harvest_mode: str,
+        failed_retry_seconds: int = 0,
     ) -> bool:
+        reason_case = self._harvest_reason_case_sql()
+        case_params = self._harvest_reason_case_params(
+            now_ts=now_ts,
+            ratings_ttl_seconds=ratings_ttl_seconds,
+            failed_retry_seconds=failed_retry_seconds,
+        )
         row = self.conn.execute(
-            "SELECT * FROM titles WHERE tmdb_id = ? AND media_type = ?",
-            (tmdb_id, media_type),
+            f"""
+            SELECT {reason_case} AS harvest_reason
+            FROM titles
+            WHERE tmdb_id = ? AND media_type = ?
+            """,
+            (*case_params, tmdb_id, media_type),
         ).fetchone()
+        if row is None:
+            # Missing title row is considered "new".
+            return True
 
-        is_new = row is None or not row["last_harvested_at"]
-        has_failed_enrichment = bool(
-            row is not None
-            and str(row["last_error"] or "").strip()
-        )
-        is_ttl_stale = bool(
-            row is not None
-            and row["last_harvested_at"]
-            and now_ts - int(row["last_harvested_at"]) >= ratings_ttl_seconds
-        )
-
-        if harvest_mode == "new_only":
-            return is_new
-        if harvest_mode == "failed_only":
-            return has_failed_enrichment
-        if harvest_mode == "ttl_only":
-            return is_ttl_stale
-
-        # default: all => new + failed + ttl
-        return is_new or has_failed_enrichment or is_ttl_stale
+        reason = str(row["harvest_reason"] or "").strip().lower()
+        return reason in {"failed", "new", "ttl"}
 
     def _upsert_title(
         self,
@@ -1824,6 +2205,114 @@ class LocalDatabase:
             "titles_last_harvested_at": int(row["titles_last_harvested_at"] or 0),
             "titles_last_mdblist_fetch_at": int(row["titles_last_mdblist_fetch_at"] or 0),
         }
+
+
+class IMDbTMDBCache:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+        self._init_schema()
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def _init_schema(self) -> None:
+        with self.conn:
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            self.conn.execute("PRAGMA synchronous=NORMAL")
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS imdb_tmdb_cache (
+                    imdb_id TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    tmdb_id INTEGER NOT NULL,
+                    title TEXT,
+                    popularity REAL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (imdb_id, media_type)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_imdb_tmdb_cache_tmdb
+                ON imdb_tmdb_cache (tmdb_id, media_type)
+                """
+            )
+
+    def get(
+        self, imdb_id: str, media_type: str
+    ) -> Optional[Tuple[int, str, float]]:
+        normalized_imdb = normalize_imdb_title_id(imdb_id)
+        normalized_media = str(media_type or "").strip().lower()
+        if not normalized_imdb or normalized_media not in {"movie", "tv"}:
+            return None
+        row = self.conn.execute(
+            """
+            SELECT tmdb_id, title, popularity
+            FROM imdb_tmdb_cache
+            WHERE imdb_id = ? AND media_type = ?
+            """,
+            (normalized_imdb, normalized_media),
+        ).fetchone()
+        if row is None:
+            return None
+        tmdb_id = parse_int(row["tmdb_id"])
+        if tmdb_id is None:
+            return None
+        title = str(row["title"] or "").strip()
+        try:
+            popularity = float(row["popularity"] or 0.0)
+        except (TypeError, ValueError):
+            popularity = 0.0
+        return tmdb_id, title, popularity
+
+    def upsert(
+        self,
+        *,
+        imdb_id: str,
+        media_type: str,
+        tmdb_id: int,
+        title: str,
+        popularity: float,
+        updated_at: int,
+    ) -> None:
+        normalized_imdb = normalize_imdb_title_id(imdb_id)
+        normalized_media = str(media_type or "").strip().lower()
+        if (
+            not normalized_imdb
+            or normalized_media not in {"movie", "tv"}
+            or parse_int(tmdb_id) is None
+        ):
+            return
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO imdb_tmdb_cache(
+                    imdb_id,
+                    media_type,
+                    tmdb_id,
+                    title,
+                    popularity,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(imdb_id, media_type) DO UPDATE SET
+                    tmdb_id = excluded.tmdb_id,
+                    title = excluded.title,
+                    popularity = excluded.popularity,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    normalized_imdb,
+                    normalized_media,
+                    int(tmdb_id),
+                    str(title or "").strip(),
+                    float(popularity or 0.0),
+                    int(updated_at),
+                ),
+            )
 
 
 class ServiceGate:
@@ -2592,7 +3081,7 @@ class MDBListClient:
         candidates: Sequence[Candidate],
         on_chunk: Optional[
             Callable[
-                [str, Sequence[int], Dict[int, Dict[str, Any]], Set[int], int, int], None
+                [str, Sequence[int], Dict[int, Dict[str, Any]], Set[int], int, int], bool
             ]
         ] = None,
         stop_event: Optional[asyncio.Event] = None,
@@ -2681,7 +3170,7 @@ class MDBListClient:
                     results[(media_type, tmdb_id)] = item
 
                 if on_chunk is not None:
-                    on_chunk(
+                    should_continue = on_chunk(
                         media_type,
                         chunk,
                         chunk_results,
@@ -2689,6 +3178,15 @@ class MDBListClient:
                         chunk_index,
                         total_chunks,
                     )
+                    if should_continue is False:
+                        halted_early = True
+                        halt_reason = "daily title limit reached"
+                        LOGGER.info(
+                            "[MDBList] Halting remaining %s batches for this cycle (%s).",
+                            media_type,
+                            halt_reason,
+                        )
+                        break
 
             if halted_early:
                 break
@@ -3516,12 +4014,17 @@ class RuntimeDashboard:
         db: LocalDatabase,
         submitter_workers: int,
         event_buffer: DashboardEventBuffer,
+        discovery_mode: str = "source",
         event_lines: int = 8,
         refresh_seconds: float = 0.5,
     ):
         self.db = db
         self.submitter_workers = max(1, int(submitter_workers))
         self.event_buffer = event_buffer
+        normalized_mode = str(discovery_mode or "source").strip().lower()
+        if normalized_mode not in SUPPORTED_DISCOVERY_MODES:
+            normalized_mode = "source"
+        self.discovery_mode = normalized_mode
         self.event_lines = max(3, int(event_lines))
         self.refresh_seconds = max(0.1, float(refresh_seconds))
         self.started_at = now_epoch()
@@ -3540,6 +4043,20 @@ class RuntimeDashboard:
         self.scan_current_source_total = 0
         self.scan_source_order: List[str] = []
         self.scan_source_stats: Dict[str, Dict[str, int]] = {}
+        self.scan_cap_reached = False
+
+        self.local_due_total = 0
+        self.local_due_failed = 0
+        self.local_due_new = 0
+        self.local_due_ttl = 0
+        self.local_selected_total = 0
+        self.local_selected_failed = 0
+        self.local_selected_new = 0
+        self.local_selected_ttl = 0
+        self.local_budget_limit = 0
+        self.local_budget_used = 0
+        self.local_budget_remaining = 0
+        self.local_budget_capped = 0
 
         self.details_total = 0
         self.details_done = 0
@@ -3618,6 +4135,31 @@ class RuntimeDashboard:
     def set_submitter_workers(self, workers: int) -> None:
         self.submitter_workers = max(1, int(workers))
 
+    def set_discovery_mode(self, discovery_mode: str) -> None:
+        normalized_mode = str(discovery_mode or "source").strip().lower()
+        if normalized_mode not in SUPPORTED_DISCOVERY_MODES:
+            normalized_mode = "source"
+        self.discovery_mode = normalized_mode
+
+    def update_local_stats(self, stats: Optional[Dict[str, int]]) -> None:
+        if not isinstance(stats, dict):
+            return
+        self.local_due_total = max(0, int(stats.get("due_total") or 0))
+        self.local_due_failed = max(0, int(stats.get("due_failed") or 0))
+        self.local_due_new = max(0, int(stats.get("due_new") or 0))
+        self.local_due_ttl = max(0, int(stats.get("due_ttl") or 0))
+        self.local_selected_total = max(0, int(stats.get("selected_total") or 0))
+        self.local_selected_failed = max(0, int(stats.get("selected_failed") or 0))
+        self.local_selected_new = max(0, int(stats.get("selected_new") or 0))
+        self.local_selected_ttl = max(0, int(stats.get("selected_ttl") or 0))
+        self.local_budget_limit = max(0, int(stats.get("budget_limit") or 0))
+        self.local_budget_used = max(0, int(stats.get("budget_used") or 0))
+        self.local_budget_remaining = max(0, int(stats.get("budget_remaining") or 0))
+        self.local_budget_capped = 1 if int(stats.get("budget_capped") or 0) > 0 else 0
+
+    def update_scan_cap_reached(self, capped: bool) -> None:
+        self.scan_cap_reached = bool(capped)
+
     def begin_cycle(self, *, sources: Sequence[Any]) -> None:
         self.cycle_index += 1
         self.phase = "Candidate scan"
@@ -3634,6 +4176,7 @@ class RuntimeDashboard:
         self.scan_current_source_total = 0
         self.scan_source_order = []
         self.scan_source_stats = {}
+        self.scan_cap_reached = False
         for source in sources:
             source_name = source.name
             max_pages = max(1, int(source.max_pages))
@@ -4034,6 +4577,7 @@ class RuntimeDashboard:
             if self.scan_raw_seen > 0
             else 0.0
         )
+        cap_token = " cap=1" if self.scan_cap_reached else ""
         table.add_row(
             "Source scan",
             self._render_bar(self.scan_pages_total, self.scan_pages_done),
@@ -4045,6 +4589,7 @@ class RuntimeDashboard:
                 f"seen={int(scan_seen)} "
                 f"err={int(scan_errors)} "
                 f"elig={eligibility_pct:.2f}%"
+                f"{cap_token}"
             ),
         )
 
@@ -4167,7 +4712,7 @@ class RuntimeDashboard:
         )
 
         subtitle = (
-            f"phase={self.phase} cycle={self.cycle_index} "
+            f"mode={self.discovery_mode} phase={self.phase} cycle={self.cycle_index} "
             f"cycle_started={self._format_iso(self.cycle_started_at)}"
         )
         return Panel(
@@ -4175,6 +4720,144 @@ class RuntimeDashboard:
             title="Harvester",
             subtitle=subtitle,
             border_style="cyan",
+            title_align="left",
+            subtitle_align="left",
+        )
+
+    def _render_updater_panel(self) -> Panel:
+        table = Table.grid(expand=True, padding=(0, 0))
+        table.add_column(
+            "Stage",
+            no_wrap=True,
+            style="bold blue",
+            width=self.STAGE_COL_WIDTH,
+            min_width=self.STAGE_COL_WIDTH,
+            max_width=self.STAGE_COL_WIDTH,
+        )
+        table.add_column(
+            "Progress",
+            no_wrap=True,
+            width=self.PROGRESS_COL_WIDTH,
+            min_width=self.PROGRESS_COL_WIDTH,
+            max_width=self.PROGRESS_COL_WIDTH,
+        )
+        table.add_column(
+            "Details",
+            style="white",
+            no_wrap=True,
+            overflow="crop",
+            justify="left",
+            ratio=1,
+        )
+
+        table.add_row(
+            "Due local",
+            Text("-"),
+            (
+                f"total={int(self.local_due_total)} "
+                f"failed={int(self.local_due_failed)} "
+                f"new={int(self.local_due_new)} "
+                f"ttl={int(self.local_due_ttl)}"
+            ),
+        )
+        table.add_row(
+            "Selected local",
+            Text("-"),
+            (
+                f"total={int(self.local_selected_total)} "
+                f"failed={int(self.local_selected_failed)} "
+                f"new={int(self.local_selected_new)} "
+                f"ttl={int(self.local_selected_ttl)}"
+            ),
+        )
+        budget_progress = self._render_bar(self.local_budget_limit, self.local_budget_used)
+        table.add_row(
+            "Budget",
+            budget_progress,
+            (
+                f"limit={int(self.local_budget_limit)} "
+                f"used={int(self.local_budget_used)} "
+                f"remaining={int(self.local_budget_remaining)} "
+                f"capped={int(self.local_budget_capped)}"
+            ),
+        )
+
+        if self.discovery_mode == "local":
+            details_success_pct = (
+                (self.details_ok / self.details_done) * 100.0
+                if self.details_done > 0
+                else 0.0
+            )
+            table.add_row(
+                "TMDB details",
+                self._render_bar(self.details_total, self.details_done),
+                (
+                    f"{int(self.details_done)}/{int(self.details_total)} "
+                    f"ok={int(self.details_ok)} "
+                    f"fail={int(self.details_failed)} "
+                    f"suc={details_success_pct:.2f}%"
+                ),
+            )
+
+            md_movie_miss = max(0, self.md_movie_attempted - self.md_movie_found)
+            md_movie_success = (
+                (self.md_movie_found / self.md_movie_attempted) * 100.0
+                if self.md_movie_attempted > 0
+                else 0.0
+            )
+            table.add_row(
+                "MDBList movie",
+                self._render_bar(self.md_movie_batches_total, self.md_movie_batches_done),
+                (
+                    f"{int(self.md_movie_attempted)}/{int(self.md_movie_ids_total)} "
+                    f"ok={int(self.md_movie_found)} "
+                    f"miss={int(md_movie_miss)} "
+                    f"suc={md_movie_success:.2f}% "
+                    f"b={int(self.md_movie_batches_done)}/{int(self.md_movie_batches_total)} "
+                    f"f={int(self.md_movie_failed_batches)}"
+                ),
+            )
+
+            md_tv_miss = max(0, self.md_tv_attempted - self.md_tv_found)
+            md_tv_success = (
+                (self.md_tv_found / self.md_tv_attempted) * 100.0
+                if self.md_tv_attempted > 0
+                else 0.0
+            )
+            table.add_row(
+                "MDBList tv",
+                self._render_bar(self.md_tv_batches_total, self.md_tv_batches_done),
+                (
+                    f"{int(self.md_tv_attempted)}/{int(self.md_tv_ids_total)} "
+                    f"ok={int(self.md_tv_found)} "
+                    f"miss={int(md_tv_miss)} "
+                    f"suc={md_tv_success:.2f}% "
+                    f"b={int(self.md_tv_batches_done)}/{int(self.md_tv_batches_total)} "
+                    f"f={int(self.md_tv_failed_batches)}"
+                ),
+            )
+
+            table.add_row(
+                "Enriched",
+                self._render_bar(self.enriched_total, self.enriched_done),
+                (
+                    f"{int(self.enriched_done)}/{int(self.enriched_total)} "
+                    f"md_ok={int(self.enriched_mdblist_ok)} "
+                    f"md_miss={int(self.enriched_mdblist_miss)} "
+                    f"tm_only={int(self.enriched_tmdb_only)} "
+                    f"q(r={int(self.enriched_queue_ratings)},m={int(self.enriched_queue_mappings)})"
+                ),
+            )
+
+        subtitle = (
+            f"mode={self.discovery_mode} phase={self.phase} cycle={self.cycle_index} "
+            f"cycle_started={self._format_iso(self.cycle_started_at)}"
+        )
+        return Panel(
+            table,
+            title="Updater",
+            subtitle=subtitle,
+            border_style="blue",
             title_align="left",
             subtitle_align="left",
         )
@@ -4414,16 +5097,25 @@ class RuntimeDashboard:
         now_ts = now_epoch()
         uptime = self._format_duration(now_ts - self.started_at)
         header = Text(
-            f"mdblist-pmdb live status | uptime={uptime} | cycle={self.cycle_index} | phase={self.phase}",
+            (
+                "mdblist-pmdb live status | "
+                f"mode={self.discovery_mode} | uptime={uptime} | "
+                f"cycle={self.cycle_index} | phase={self.phase}"
+            ),
             style="bold",
         )
-        return Group(
-            header,
-            self._render_harvester_panel(now_ts),
-            self._render_submitter_panel(now_ts),
-            self._render_events_panel(),
-            self._render_system_panel(),
-        )
+        panels: List[Any] = [header]
+        if self.discovery_mode == "source":
+            panels.append(self._render_harvester_panel(now_ts))
+        elif self.discovery_mode == "local":
+            panels.append(self._render_updater_panel())
+        else:
+            panels.append(self._render_harvester_panel(now_ts))
+            panels.append(self._render_updater_panel())
+        panels.append(self._render_submitter_panel(now_ts))
+        panels.append(self._render_events_panel())
+        panels.append(self._render_system_panel())
+        return Group(*panels)
 
     async def run(self, stop_event: asyncio.Event) -> None:
         self._refresh_from_db(force=True)
@@ -4459,9 +5151,13 @@ class Harvester:
         self.mdblist_client = mdblist_client
         self.status = status
 
+        self.discovery_mode = str(config["runtime"].get("discovery_mode", "source")).strip().lower()
+        self.daily_title_limit = max(1, int(config["runtime"].get("daily_title_limit", 100000)))
+        self.hybrid_source_interval_seconds = max(
+            1, int(config["runtime"].get("hybrid_source_interval_hours", 24))
+        ) * 3600
         self.ratings_ttl_seconds = int(config["runtime"]["ratings_refresh_days"]) * 86400
-        self.harvest_mode = str(config["runtime"]["harvest_mode"]).strip().lower()
-        self.run_mode = str(config["runtime"].get("run_mode", "continuous")).strip().lower()
+        self.failed_retry_seconds = max(0, int(config["runtime"]["failed_refresh_days"])) * 86400
         self.imdb_archive_auto_update_enabled = bool(
             config["runtime"].get("imdb_archive_auto_update_enabled", True)
         )
@@ -4484,7 +5180,13 @@ class Harvester:
             != IMDB_ARCHIVE_SOURCE_NAME
         ]
         self.imdb_archive_source: Optional[IMDbArchiveSource] = None
-        imdb_path = Path(str(config["runtime"].get("imdb_archive_path", "")).strip()).expanduser()
+        raw_imdb_path = str(config["runtime"].get("imdb_archive_path", "")).strip()
+        if raw_imdb_path:
+            imdb_path = Path(raw_imdb_path).expanduser()
+        else:
+            imdb_path = self.db.path.parent / "imdb"
+        imdb_path.mkdir(parents=True, exist_ok=True)
+        self.imdb_cache = IMDbTMDBCache(imdb_path / "imdb_tmdb_cache.sqlite3")
         for entry in config["tmdb"]["sources"]:
             name = str(entry.get("name", "")).strip().lower().lstrip("/")
             if name != IMDB_ARCHIVE_SOURCE_NAME or not bool(entry.get("enabled", True)):
@@ -4513,7 +5215,58 @@ class Harvester:
         self._imdb_exhausted_key = IMDB_ARCHIVE_EXHAUSTED_KEY
         self._imdb_last_update_key = IMDB_ARCHIVE_LAST_UPDATE_KEY
         self._imdb_last_update_attempt_key = IMDB_ARCHIVE_LAST_UPDATE_ATTEMPT_KEY
+        self._imdb_last_update_marker_path = imdb_path / ".imdb_archive_last_update_epoch"
+        self._daily_budget_key_prefix = DISCOVERY_DAILY_USED_KEY_PREFIX
+        self._hybrid_source_last_run_key = HYBRID_SOURCE_LAST_RUN_KEY
+        self._local_cycle_metrics_key = LOCAL_CYCLE_METRICS_KEY
         self._checkpoint_key = HARVEST_CHECKPOINT_KEY
+        if self.status is not None:
+            self.status.set_discovery_mode(self.discovery_mode)
+            self.status.update_local_stats(self._init_local_stats(local_day_key()))
+
+    def close(self) -> None:
+        self.imdb_cache.close()
+
+    def _daily_budget_key(self, day_key: str) -> str:
+        return f"{self._daily_budget_key_prefix}{day_key}"
+
+    def _daily_budget_used(self, day_key: str) -> int:
+        return max(0, self.db.get_state_int(self._daily_budget_key(day_key), 0))
+
+    def _consume_daily_budget(self, day_key: str, requested: int) -> int:
+        want = max(0, int(requested))
+        if want <= 0:
+            return 0
+        key = self._daily_budget_key(day_key)
+        used = self._daily_budget_used(day_key)
+        remaining = max(0, self.daily_title_limit - used)
+        reserve = min(want, remaining)
+        if reserve <= 0:
+            return 0
+        self.db.set_state(key, used + reserve)
+        return reserve
+
+    def _mdblist_daily_quota_pause_until(self, now_ts: int) -> int:
+        row = self.db.get_service_state("mdblist")
+        if row is None:
+            return 0
+
+        paused_until = max(0, int(row["paused_until"] or 0))
+        pause_reason = str(row["pause_reason"] or "").strip().lower()
+        rate_remaining = parse_int(row["rate_remaining"])
+        rate_reset = max(0, int(parse_int(row["rate_reset"]) or 0))
+
+        if rate_remaining == 0 and rate_reset > int(now_ts):
+            return rate_reset
+        if paused_until > int(now_ts) and (pause_reason == "daily limit reached" or rate_remaining == 0):
+            return paused_until
+        return 0
+
+    def _hybrid_source_due(self, now_ts: int) -> bool:
+        last_run = max(0, self.db.get_state_int(self._hybrid_source_last_run_key, 0))
+        if last_run <= 0:
+            return True
+        return (int(now_ts) - int(last_run)) >= self.hybrid_source_interval_seconds
 
     def _reset_imdb_cursor(self, *, exhausted: bool = False) -> None:
         self.db.set_state(self._imdb_cursor_line_key, 0)
@@ -4566,20 +5319,43 @@ class Harvester:
         except Exception:
             return
 
+    def _read_imdb_update_marker_epoch(self) -> Optional[int]:
+        try:
+            raw = self._imdb_last_update_marker_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            return None
+        except Exception:
+            return None
+        parsed = parse_int(raw)
+        if parsed is None or parsed <= 0:
+            return None
+        return int(parsed)
+
+    def _write_imdb_update_marker_epoch(self, epoch_seconds: int) -> None:
+        safe_epoch = max(1, int(epoch_seconds))
+        tmp_path = self._imdb_last_update_marker_path.parent / (
+            f".{self._imdb_last_update_marker_path.name}.tmp"
+        )
+        try:
+            tmp_path.write_text(str(safe_epoch), encoding="utf-8")
+            tmp_path.replace(self._imdb_last_update_marker_path)
+        except Exception:
+            self._safe_unlink(tmp_path)
+
     @staticmethod
-    def _file_created_epoch(path: Path) -> Optional[int]:
+    def _file_timestamp_epoch(path: Path) -> Optional[int]:
         try:
             stat_result = path.stat()
         except Exception:
             return None
-        created_value = getattr(stat_result, "st_birthtime", None)
-        if created_value is None:
+        timestamp_value = getattr(stat_result, "st_mtime", None)
+        if timestamp_value is None:
             return None
         try:
-            created_int = int(created_value)
+            timestamp_int = int(timestamp_value)
         except (TypeError, ValueError):
             return None
-        return created_int if created_int > 0 else None
+        return timestamp_int if timestamp_int > 0 else None
 
     def _download_and_extract_imdb_dataset(
         self,
@@ -4616,14 +5392,14 @@ class Harvester:
         gz_path = archive_dir / f"{dataset_name}.gz"
         if not gz_path.exists():
             return False
-        created_at = self._file_created_epoch(gz_path)
-        if created_at is None:
+        file_timestamp = self._file_timestamp_epoch(gz_path)
+        if file_timestamp is None:
             LOGGER.info(
-                "[IMDbArchive] Skipping local %s extraction: .gz creation time unavailable.",
+                "[IMDbArchive] Skipping local %s extraction: .gz timestamp unavailable.",
                 dataset_name,
             )
             return False
-        age_seconds = max(0, int(now_ts - created_at))
+        age_seconds = max(0, int(now_ts - file_timestamp))
         if age_seconds > max_age_seconds:
             LOGGER.info(
                 "[IMDbArchive] Skipping local %s extraction: .gz is stale (%ss old > %ss).",
@@ -4663,31 +5439,46 @@ class Harvester:
         now_ts = now_epoch()
         required_tsv_paths = [archive_dir / dataset for dataset in IMDB_ARCHIVE_DATASET_URLS]
         missing_files = [path for path in required_tsv_paths if not path.exists()]
+        extracted_from_local_gz = False
         if missing_files:
             for dataset_name in IMDB_ARCHIVE_DATASET_URLS:
-                self._extract_local_imdb_gz_if_needed(
+                extracted = self._extract_local_imdb_gz_if_needed(
                     dataset_name=dataset_name,
                     archive_dir=archive_dir,
                     now_ts=now_ts,
                     max_age_seconds=self.imdb_archive_update_interval_seconds,
                 )
+                extracted_from_local_gz = extracted_from_local_gz or extracted
             missing_files = [path for path in required_tsv_paths if not path.exists()]
+            if extracted_from_local_gz and not missing_files:
+                self._write_imdb_update_marker_epoch(now_ts)
 
         update_due = bool(missing_files)
         if not update_due:
-            created_values = [
-                self._file_created_epoch(path) for path in required_tsv_paths
-            ]
-            if any(value is None for value in created_values):
-                LOGGER.warning(
-                    "[IMDbArchive] Auto-update skipped: file creation time is unavailable for one or more TSV files."
+            last_update_reference = self._read_imdb_update_marker_epoch()
+            if last_update_reference is None:
+                db_last_update = max(0, self.db.get_state_int(self._imdb_last_update_key, 0))
+                if db_last_update > 0:
+                    last_update_reference = db_last_update
+                    self._write_imdb_update_marker_epoch(last_update_reference)
+
+            if last_update_reference is None:
+                timestamp_values = [
+                    self._file_timestamp_epoch(path) for path in required_tsv_paths
+                ]
+                if any(value is None for value in timestamp_values):
+                    LOGGER.warning(
+                        "[IMDbArchive] Auto-update skipped: file timestamps are unavailable for one or more TSV files."
+                    )
+                    return
+                timestamp_reference = min(
+                    int(value) for value in timestamp_values if value is not None
                 )
-                return
-            created_at_reference = min(
-                int(value) for value in created_values if value is not None
-            )
+                last_update_reference = timestamp_reference
+                self._write_imdb_update_marker_epoch(last_update_reference)
+
             update_due = (
-                now_ts - created_at_reference >= self.imdb_archive_update_interval_seconds
+                now_ts - int(last_update_reference) >= self.imdb_archive_update_interval_seconds
             )
         if not update_due:
             return
@@ -4747,6 +5538,7 @@ class Harvester:
                 self._safe_unlink(archive_dir / f"{dataset_name}.gz")
 
             self.db.set_state(self._imdb_last_update_key, now_ts)
+            self._write_imdb_update_marker_epoch(now_ts)
             LOGGER.info(
                 "[IMDbArchive] Auto-update completed: %s dataset(s) refreshed.",
                 len(staging),
@@ -4974,6 +5766,83 @@ class Harvester:
             popularity = 0.0
         return tmdb_id, title, popularity
 
+    def _resolve_imdb_to_tmdb_local(
+        self,
+        *,
+        imdb_id: str,
+        media_type: str,
+    ) -> Optional[Candidate]:
+        normalized_imdb = normalize_imdb_title_id(imdb_id)
+        normalized_media = str(media_type or "").strip().lower()
+        if not normalized_imdb or normalized_media not in {"movie", "tv"}:
+            return None
+
+        mapping_row = self.db.conn.execute(
+            """
+            SELECT t.tmdb_id, t.title, t.popularity
+            FROM mappings m
+            JOIN titles t
+              ON t.tmdb_id = m.tmdb_id
+             AND t.media_type = m.media_type
+            WHERE m.id_type = 'imdb'
+              AND m.id_value = ?
+              AND m.media_type = ?
+            ORDER BY COALESCE(t.last_harvested_at, 0) DESC, t.tmdb_id ASC
+            LIMIT 1
+            """,
+            (normalized_imdb, normalized_media),
+        ).fetchone()
+        if mapping_row is not None:
+            tmdb_id = parse_int(mapping_row["tmdb_id"])
+            if tmdb_id is not None:
+                title = str(mapping_row["title"] or "").strip() or f"TMDB-{tmdb_id}"
+                try:
+                    popularity = float(mapping_row["popularity"] or 0.0)
+                except (TypeError, ValueError):
+                    popularity = 0.0
+                return Candidate(
+                    tmdb_id=tmdb_id,
+                    media_type=normalized_media,
+                    title=title,
+                    popularity=popularity,
+                )
+
+        title_row = self.db.conn.execute(
+            """
+            SELECT tmdb_id, title, popularity
+            FROM titles
+            WHERE imdb_id = ? AND media_type = ?
+            ORDER BY COALESCE(last_harvested_at, 0) DESC, tmdb_id ASC
+            LIMIT 1
+            """,
+            (normalized_imdb, normalized_media),
+        ).fetchone()
+        if title_row is not None:
+            tmdb_id = parse_int(title_row["tmdb_id"])
+            if tmdb_id is not None:
+                title = str(title_row["title"] or "").strip() or f"TMDB-{tmdb_id}"
+                try:
+                    popularity = float(title_row["popularity"] or 0.0)
+                except (TypeError, ValueError):
+                    popularity = 0.0
+                return Candidate(
+                    tmdb_id=tmdb_id,
+                    media_type=normalized_media,
+                    title=title,
+                    popularity=popularity,
+                )
+
+        cached = self.imdb_cache.get(normalized_imdb, normalized_media)
+        if cached is None:
+            return None
+        cached_tmdb_id, cached_title, cached_popularity = cached
+        return Candidate(
+            tmdb_id=int(cached_tmdb_id),
+            media_type=normalized_media,
+            title=str(cached_title or "").strip() or f"TMDB-{cached_tmdb_id}",
+            popularity=float(cached_popularity or 0.0),
+        )
+
     async def _map_imdb_candidates_to_tmdb(
         self,
         *,
@@ -5010,6 +5879,28 @@ class Harvester:
                 except asyncio.QueueEmpty:
                     return
                 try:
+                    local_candidate = self._resolve_imdb_to_tmdb_local(
+                        imdb_id=item.imdb_id,
+                        media_type=item.media_type,
+                    )
+                    if local_candidate is not None:
+                        async with lock:
+                            mapped.append(local_candidate)
+                            mapped_count += 1
+                            completed += 1
+                            if self.status is not None and (
+                                completed == 1
+                                or completed == len(candidates)
+                                or completed % progress_every == 0
+                            ):
+                                self.status.update_imdb_mapping(
+                                    done=completed,
+                                    ok=mapped_count,
+                                    missing=missing_mappings,
+                                    errors=lookup_errors,
+                                )
+                        continue
+
                     response = await self.tmdb_client.fetch_find_by_imdb(item.imdb_id)
                     if not response.ok or not isinstance(response.data, dict):
                         async with lock:
@@ -5048,6 +5939,14 @@ class Harvester:
                                 )
                         continue
                     async with lock:
+                        self.imdb_cache.upsert(
+                            imdb_id=item.imdb_id,
+                            media_type=item.media_type,
+                            tmdb_id=tmdb_id,
+                            title=title or f"TMDB-{tmdb_id}",
+                            popularity=popularity,
+                            updated_at=now_epoch(),
+                        )
                         mapped.append(
                             Candidate(
                                 tmdb_id=tmdb_id,
@@ -5124,15 +6023,21 @@ class Harvester:
         candidates: Sequence[Candidate],
         source_stats: Optional[Dict[str, Dict[str, int]]] = None,
         tmdb_list_request_errors: int = 0,
+        local_stats: Optional[Dict[str, int]] = None,
+        budget_day_key: str = "",
+        budget_reserved: int = 0,
         note: str = "",
     ) -> None:
         payload = {
             "version": 1,
             "phase": phase,
             "updated_at": now_epoch(),
-            "harvest_mode": self.harvest_mode,
+            "discovery_mode": self.discovery_mode,
             "tmdb_list_request_errors": int(tmdb_list_request_errors),
             "source_stats": source_stats or {},
+            "local_stats": local_stats or {},
+            "budget_day_key": str(budget_day_key or ""),
+            "budget_reserved": max(0, int(budget_reserved)),
             "candidates": [self._serialize_candidate(c) for c in candidates],
             "note": note,
         }
@@ -5158,11 +6063,24 @@ class Harvester:
 
     def _restore_checkpoint_candidates(
         self, payload: Dict[str, Any]
-    ) -> Tuple[List[Candidate], Dict[str, Dict[str, int]], int, str]:
+    ) -> Tuple[
+        List[Candidate],
+        Dict[str, Dict[str, int]],
+        int,
+        str,
+        str,
+        Dict[str, int],
+        str,
+        int,
+    ]:
         candidates_raw = payload.get("candidates")
         source_stats_raw = payload.get("source_stats")
+        local_stats_raw = payload.get("local_stats")
         tmdb_list_request_errors = parse_int(payload.get("tmdb_list_request_errors")) or 0
         phase = str(payload.get("phase") or "").strip() or "unknown"
+        discovery_mode = str(payload.get("discovery_mode") or "").strip().lower()
+        budget_day_key = str(payload.get("budget_day_key") or "").strip()
+        budget_reserved = max(0, int(parse_int(payload.get("budget_reserved")) or 0))
 
         candidates: List[Candidate] = []
         if isinstance(candidates_raw, list):
@@ -5179,7 +6097,7 @@ class Harvester:
                 media_type=candidate.media_type,
                 now_ts=now_ts,
                 ratings_ttl_seconds=self.ratings_ttl_seconds,
-                harvest_mode=self.harvest_mode,
+                failed_retry_seconds=self.failed_retry_seconds,
             ):
                 filtered_candidates.append(candidate)
 
@@ -5203,7 +6121,37 @@ class Harvester:
                     "last_page": int(value.get("last_page") or 0),
                 }
 
-        return filtered_candidates, source_stats, tmdb_list_request_errors, phase
+        local_stats: Dict[str, int] = {
+            "due_total": 0,
+            "due_failed": 0,
+            "due_new": 0,
+            "due_ttl": 0,
+            "selected_total": 0,
+            "selected_failed": 0,
+            "selected_new": 0,
+            "selected_ttl": 0,
+            "budget_limit": self.daily_title_limit,
+            "budget_used": 0,
+            "budget_remaining": self.daily_title_limit,
+            "budget_capped": 0,
+        }
+        if isinstance(local_stats_raw, dict):
+            for key in list(local_stats.keys()):
+                if key in {"budget_limit", "budget_used", "budget_remaining", "budget_capped"}:
+                    local_stats[key] = max(0, int(local_stats_raw.get(key) or 0))
+                else:
+                    local_stats[key] = max(0, int(local_stats_raw.get(key) or 0))
+
+        return (
+            filtered_candidates,
+            source_stats,
+            tmdb_list_request_errors,
+            phase,
+            discovery_mode,
+            local_stats,
+            budget_day_key,
+            budget_reserved,
+        )
 
     def _save_candidate_enrichment(
         self,
@@ -5247,12 +6195,111 @@ class Harvester:
         tmdb_only = 1 if (md_item is None and details is not None) else 0
         return mdblist_ok, mdblist_miss, tmdb_only, queued_ratings, queued_mappings
 
-    async def _collect_candidates(
-        self, stop_event: asyncio.Event
+    def _init_local_stats(self, day_key: str) -> Dict[str, int]:
+        used = self._daily_budget_used(day_key)
+        remaining = max(0, self.daily_title_limit - used)
+        return {
+            "due_total": 0,
+            "due_failed": 0,
+            "due_new": 0,
+            "due_ttl": 0,
+            "selected_total": 0,
+            "selected_failed": 0,
+            "selected_new": 0,
+            "selected_ttl": 0,
+            "budget_limit": self.daily_title_limit,
+            "budget_used": used,
+            "budget_remaining": remaining,
+            "budget_capped": 1 if remaining <= 0 else 0,
+        }
+
+    def _local_due_counts(self, now_ts: int) -> Dict[str, int]:
+        return self.db.local_due_counts(
+            now_ts=now_ts,
+            ratings_ttl_seconds=self.ratings_ttl_seconds,
+            failed_retry_seconds=self.failed_retry_seconds,
+        )
+
+    async def _collect_local_candidates(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        max_candidates: Optional[int] = None,
+        day_key: str,
+    ) -> Tuple[List[Candidate], Dict[str, int], bool]:
+        stats = self._init_local_stats(day_key)
+        now_ts = now_epoch()
+        due_counts = self._local_due_counts(now_ts)
+        stats["due_total"] = due_counts["total"]
+        stats["due_failed"] = due_counts["failed"]
+        stats["due_new"] = due_counts["new"]
+        stats["due_ttl"] = due_counts["ttl"]
+
+        if stop_event.is_set():
+            return [], stats, True
+        if max_candidates is None:
+            limit = max(0, int(due_counts["total"]))
+        else:
+            limit = max(0, int(max_candidates))
+        if limit <= 0:
+            return [], stats, False
+
+        rows = self.db.select_local_due_titles(
+            now_ts=now_ts,
+            ratings_ttl_seconds=self.ratings_ttl_seconds,
+            limit=limit,
+            failed_retry_seconds=self.failed_retry_seconds,
+        )
+
+        candidates: List[Candidate] = []
+        for row in rows:
+            tmdb_id = parse_int(row["tmdb_id"])
+            media_type = str(row["media_type"] or "").strip().lower()
+            if tmdb_id is None or media_type not in {"movie", "tv"}:
+                continue
+            title = str(row["title"] or "").strip() or f"TMDB-{tmdb_id}"
+            try:
+                popularity = float(row["popularity"] or 0.0)
+            except (TypeError, ValueError):
+                popularity = 0.0
+            candidates.append(
+                Candidate(
+                    tmdb_id=tmdb_id,
+                    media_type=media_type,
+                    title=title,
+                    popularity=popularity,
+                )
+            )
+            harvest_reason = str(row["harvest_reason"] or "").strip().lower()
+            if harvest_reason == "failed":
+                stats["selected_failed"] += 1
+            elif harvest_reason == "new":
+                stats["selected_new"] += 1
+            elif harvest_reason == "ttl":
+                stats["selected_ttl"] += 1
+            else:
+                # Defensive fallback; query already filters to known reasons.
+                stats["selected_new"] += 1
+
+        stats["selected_total"] = len(candidates)
+        stats["budget_capped"] = 1 if (
+            max_candidates is not None
+            and len(candidates) >= limit
+            and due_counts["total"] > len(candidates)
+        ) else 0
+        return candidates, stats, False
+
+    async def _collect_source_candidates(
+        self,
+        stop_event: asyncio.Event,
+        *,
+        max_candidates: Optional[int] = None,
     ) -> Tuple[List[Candidate], Dict[str, Dict[str, int]], bool]:
         candidates: List[Candidate] = []
         seen: Set[Tuple[str, int]] = set()
         interrupted = False
+        cap_reached = False
+        selection_limit = None if max_candidates is None else max(0, int(max_candidates))
 
         now_ts = now_epoch()
         cycle_started_ts = now_ts
@@ -5283,6 +6330,29 @@ class Harvester:
 
         if self.status is not None:
             self.status.begin_cycle(sources=self.scan_sources)
+            self.status.update_scan_cap_reached(False)
+
+        if selection_limit == 0:
+            cap_reached = True
+            if self.status is not None:
+                self.status.update_scan_cap_reached(True)
+                self.status.complete_scan(
+                    selected=0,
+                    raw_seen=0,
+                    scanned_pages=0,
+                    total_pages=max(1, configured_target_pages),
+                    source_stats=source_stats,
+                )
+            return [], source_stats, False
+
+        def reached_cap() -> bool:
+            nonlocal cap_reached
+            if selection_limit is None:
+                return False
+            if len(candidates) < selection_limit:
+                return False
+            cap_reached = True
+            return True
 
         def publish_scan_progress(
             current_source: Any,
@@ -5302,10 +6372,13 @@ class Harvester:
                 current_source_total=max(1, int(stat["pages_effective"])),
                 source_stats=source_stats,
             )
+            self.status.update_scan_cap_reached(cap_reached)
 
         for source in self.tmdb_sources:
             if stop_event.is_set():
                 interrupted = True
+                break
+            if reached_cap():
                 break
             stat = source_stats[source.name]
             effective_max_pages = source.max_pages
@@ -5313,6 +6386,8 @@ class Harvester:
             for page in range(1, source.max_pages + 1):
                 if stop_event.is_set():
                     interrupted = True
+                    break
+                if reached_cap():
                     break
                 if page > effective_max_pages:
                     break
@@ -5379,7 +6454,7 @@ class Harvester:
                         media_type=media_type,
                         now_ts=now_ts,
                         ratings_ttl_seconds=self.ratings_ttl_seconds,
-                        harvest_mode=self.harvest_mode,
+                        failed_retry_seconds=self.failed_retry_seconds,
                     )
                     if not should_harvest:
                         stat["skipped"] += 1
@@ -5405,6 +6480,8 @@ class Harvester:
                         )
                     )
                     stat["added"] += 1
+                    if reached_cap():
+                        break
 
                 if pages_scanned == 1 or pages_scanned % 25 == 0:
                     eligible_rate = (
@@ -5424,10 +6501,14 @@ class Harvester:
                         stat["pages_effective"],
                     )
                 publish_scan_progress(source, current_page=page)
+                if cap_reached:
+                    break
             if interrupted:
                 break
+            if cap_reached:
+                break
 
-        if not interrupted and self.imdb_archive_source is not None:
+        if not interrupted and not cap_reached and self.imdb_archive_source is not None:
             source = self.imdb_archive_source
             stat = source_stats[source.name]
             pages_scanned += 1
@@ -5479,6 +6560,14 @@ class Harvester:
                     stat["pages_fetched"] = max(int(stat["pages_fetched"]), current_batch)
                 publish_scan_progress(source, current_page=1)
                 if imdb_batch and not stop_event.is_set():
+                    if selection_limit is not None:
+                        remaining_slots = max(0, selection_limit - len(candidates))
+                        if remaining_slots <= 0:
+                            cap_reached = True
+                            publish_scan_progress(source, current_page=1)
+                            imdb_batch = []
+                        elif len(imdb_batch) > remaining_slots:
+                            imdb_batch = imdb_batch[:remaining_slots]
                     LOGGER.info(
                         "[IMDbArchive] Mapping %s IMDb candidate(s) to TMDB IDs.",
                         len(imdb_batch),
@@ -5502,13 +6591,15 @@ class Harvester:
                             media_type=candidate.media_type,
                             now_ts=now_ts,
                             ratings_ttl_seconds=self.ratings_ttl_seconds,
-                            harvest_mode=self.harvest_mode,
+                            failed_retry_seconds=self.failed_retry_seconds,
                         )
                         if not should_harvest:
                             stat["skipped"] += 1
                             continue
                         candidates.append(candidate)
                         stat["added"] += 1
+                        if reached_cap():
+                            break
                     LOGGER.info(
                         "[IMDbArchive] TMDB mapping complete: mapped=%s missing=%s errors=%s.",
                         len(mapped_candidates),
@@ -5544,14 +6635,16 @@ class Harvester:
             "max_pages_target_effective": max(pages_scanned, effective_target_pages),
             "selected_candidates": len(candidates),
             "raw_seen": raw_seen_total,
-            "harvest_mode": self.harvest_mode,
             "interrupted": interrupted,
+            "cap_reached": cap_reached,
+            "selection_limit": selection_limit,
             "source_order": [source.name for source in self.scan_sources],
             "sources": source_stats,
         }
         self.db.set_state("tmdb_cycle_metrics", json.dumps(cycle_metrics))
 
         if self.status is not None:
+            self.status.update_scan_cap_reached(cap_reached)
             self.status.complete_scan(
                 selected=len(candidates),
                 raw_seen=raw_seen_total,
@@ -5564,13 +6657,12 @@ class Harvester:
             (len(candidates) / raw_seen_total) * 100.0 if raw_seen_total > 0 else 0.0
         )
         LOGGER.debug(
-            "[Harvester] Selected %s candidates from configured sources (pages=%s/%s raw_seen=%s eligible_rate=%.2f%% mode=%s).",
+            "[Harvester] Selected %s candidates from configured sources (pages=%s/%s raw_seen=%s eligible_rate=%.2f%%).",
             len(candidates),
             pages_scanned,
             max(pages_scanned, effective_target_pages),
             raw_seen_total,
             eligible_rate,
-            self.harvest_mode,
         )
         return candidates, source_stats, interrupted
 
@@ -5666,26 +6758,14 @@ class Harvester:
         interrupted = stop_event.is_set() and completed < total
         return details, interrupted
 
-    def _submitter_queue_is_empty(self) -> bool:
-        queue_counts = self.db.queue_counts()
-        return (
-            queue_counts["ratings_pending"] == 0
-            and queue_counts["ratings_in_flight"] == 0
-            and queue_counts["mappings_pending"] == 0
-            and queue_counts["mappings_in_flight"] == 0
-        )
-
     async def run(self, stop_event: asyncio.Event) -> None:
         cycle_attempted = 0
         while not stop_event.is_set():
             cycle_start = now_epoch()
             cycle_attempted += 1
-            cycle_result: Optional[HarvestCycleResult] = None
-            cycle_failed = False
             try:
-                cycle_result = await self._run_cycle(stop_event)
+                await self._run_cycle(stop_event)
             except Exception:
-                cycle_failed = True
                 LOGGER.exception("[Harvester] Unexpected cycle failure")
 
             if stop_event.is_set():
@@ -5694,50 +6774,6 @@ class Harvester:
                     cycle_attempted,
                 )
                 break
-
-            if self.run_mode == "once":
-                LOGGER.info("[Harvester] run_mode=once: stopping after cycle %s.", cycle_attempted)
-                stop_event.set()
-                break
-
-            if self.run_mode == "until_idle":
-                if cycle_failed or cycle_result is None:
-                    LOGGER.info(
-                        "[Harvester] run_mode=until_idle: cycle %s failed, continuing.",
-                        cycle_attempted,
-                    )
-                else:
-                    has_upstream_failures = (
-                        cycle_result.tmdb_list_request_errors > 0
-                        or cycle_result.mdblist_request_failures > 0
-                    )
-                    if cycle_result.interrupted:
-                        LOGGER.info(
-                            "[Harvester] run_mode=until_idle: cycle %s interrupted, continuing.",
-                            cycle_attempted,
-                        )
-                        has_upstream_failures = True
-                    queue_empty = self._submitter_queue_is_empty()
-                    is_idle = (
-                        cycle_result.selected_candidates == 0
-                        and queue_empty
-                        and not has_upstream_failures
-                    )
-                    if is_idle:
-                        LOGGER.info(
-                            "[Harvester] run_mode=until_idle: idle reached on cycle %s (selected=0, submitter queues empty, no upstream request failures). Stopping.",
-                            cycle_attempted,
-                        )
-                        stop_event.set()
-                        break
-                    LOGGER.debug(
-                        "[Harvester] run_mode=until_idle check after cycle %s: selected=%s queue_empty=%s tmdb_list_errors=%s mdblist_failures=%s -> continuing.",
-                        cycle_attempted,
-                        cycle_result.selected_candidates,
-                        queue_empty,
-                        cycle_result.tmdb_list_request_errors,
-                        cycle_result.mdblist_request_failures,
-                    )
 
             elapsed = now_epoch() - cycle_start
             sleep_for = max(1, self.cycle_sleep_seconds - elapsed)
@@ -5751,6 +6787,105 @@ class Harvester:
         tmdb_list_request_errors = 0
         source_stats: Dict[str, Dict[str, int]] = {}
         candidates: List[Candidate] = []
+        budget_day_key = local_day_key()
+        local_stats: Dict[str, int] = self._init_local_stats(budget_day_key)
+        budget_reserved = 0
+
+        if self.status is not None:
+            self.status.set_discovery_mode(self.discovery_mode)
+            self.status.update_local_stats(local_stats)
+
+        def merge_unique_candidates(*groups: Sequence[Candidate]) -> List[Candidate]:
+            merged: List[Candidate] = []
+            seen: Set[Tuple[str, int]] = set()
+            for group in groups:
+                for candidate in group:
+                    key = (candidate.media_type, candidate.tmdb_id)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    merged.append(candidate)
+            return merged
+
+        def refresh_local_budget_stats() -> None:
+            if not budget_day_key:
+                return
+            used = self._daily_budget_used(budget_day_key)
+            remaining = max(0, self.daily_title_limit - used)
+            local_stats["budget_limit"] = self.daily_title_limit
+            local_stats["budget_used"] = used
+            local_stats["budget_remaining"] = remaining
+            local_stats["budget_capped"] = 1 if remaining <= 0 else 0
+
+        def persist_local_cycle_metrics(*, extra: Optional[Dict[str, Any]] = None) -> None:
+            if self.discovery_mode not in {"local", "hybrid"}:
+                return
+            payload: Dict[str, Any] = {
+                "updated_at": now_epoch(),
+                "mode": self.discovery_mode,
+                "day_key": budget_day_key,
+                "budget_reserved": budget_reserved,
+            }
+            payload.update(local_stats)
+            if isinstance(extra, dict):
+                payload.update(extra)
+            self.db.set_state(
+                self._local_cycle_metrics_key,
+                json.dumps(payload, separators=(",", ":")),
+            )
+
+        now_ts = now_epoch()
+        refresh_local_budget_stats()
+        if self.status is not None:
+            self.status.update_local_stats(local_stats)
+
+        if local_stats.get("budget_remaining", 0) <= 0:
+            LOGGER.info(
+                "[Harvester] Skipping cycle: daily_title_limit reached for %s (used=%s limit=%s).",
+                budget_day_key,
+                int(local_stats.get("budget_used") or 0),
+                int(local_stats.get("budget_limit") or self.daily_title_limit),
+            )
+            persist_local_cycle_metrics(
+                extra={
+                    "skipped": 1,
+                    "skip_reason": "daily_title_limit_reached",
+                    "source_due": 0,
+                    "source_ran": 0,
+                    "source_selected": 0,
+                }
+            )
+            return HarvestCycleResult(
+                selected_candidates=0,
+                tmdb_list_request_errors=0,
+                mdblist_request_failures=0,
+                interrupted=False,
+                resumed_from_checkpoint=False,
+            )
+
+        mdblist_pause_until = self._mdblist_daily_quota_pause_until(now_ts)
+        if mdblist_pause_until > now_ts:
+            LOGGER.info(
+                "[Harvester] Skipping cycle: MDBList daily quota pause active until %s.",
+                to_iso(mdblist_pause_until),
+            )
+            persist_local_cycle_metrics(
+                extra={
+                    "skipped": 1,
+                    "skip_reason": "mdblist_daily_quota_pause",
+                    "mdblist_pause_until": int(mdblist_pause_until),
+                    "source_due": 0,
+                    "source_ran": 0,
+                    "source_selected": 0,
+                }
+            )
+            return HarvestCycleResult(
+                selected_candidates=0,
+                tmdb_list_request_errors=0,
+                mdblist_request_failures=0,
+                interrupted=False,
+                resumed_from_checkpoint=False,
+            )
 
         checkpoint_payload = self._load_checkpoint()
         if checkpoint_payload is not None:
@@ -5759,19 +6894,37 @@ class Harvester:
                 restored_source_stats,
                 restored_tmdb_errors,
                 restored_phase,
+                restored_discovery_mode,
+                restored_local_stats,
+                _restored_budget_day_key,
+                _restored_budget_reserved,
             ) = self._restore_checkpoint_candidates(checkpoint_payload)
             if restored_candidates:
                 resumed_from_checkpoint = True
                 candidates = restored_candidates
                 source_stats = restored_source_stats
                 tmdb_list_request_errors = restored_tmdb_errors
+                local_stats = restored_local_stats
+                if (
+                    restored_discovery_mode
+                    and restored_discovery_mode in SUPPORTED_DISCOVERY_MODES
+                    and restored_discovery_mode != self.discovery_mode
+                ):
+                    LOGGER.warning(
+                        "[Harvester] Checkpoint mode mismatch: checkpoint=%s runtime=%s. Continuing with restored candidates.",
+                        restored_discovery_mode,
+                        self.discovery_mode,
+                    )
                 LOGGER.info(
                     "[Harvester] Resuming checkpoint: phase=%s pending_candidates=%s.",
                     restored_phase,
                     len(candidates),
                 )
                 if self.status is not None:
-                    self.status.begin_cycle(sources=self.scan_sources)
+                    resume_sources = self.scan_sources if self.discovery_mode != "local" else []
+                    self.status.begin_cycle(sources=resume_sources)
+                    self.status.update_local_stats(local_stats)
+                    self.status.update_scan_cap_reached(False)
                     resumed_raw_seen = sum(
                         int((s or {}).get("raw_seen") or 0)
                         for s in source_stats.values()
@@ -5792,22 +6945,111 @@ class Harvester:
                 self._clear_checkpoint()
 
         if not resumed_from_checkpoint:
-            LOGGER.debug("[Harvester] Cycle start: collecting source candidates.")
-            candidates, source_stats, scan_interrupted = await self._collect_candidates(stop_event)
-            tmdb_list_request_errors = sum(
-                int(stat.get("errors") or 0) for stat in source_stats.values()
-            )
-            if scan_interrupted:
+            now_ts = now_epoch()
+            budget_day_key = local_day_key(now_ts)
+            local_stats = self._init_local_stats(budget_day_key)
+            if self.status is not None:
+                self.status.update_local_stats(local_stats)
+                self.status.set_discovery_mode(self.discovery_mode)
+
+            discovery_interrupted = False
+
+            if self.discovery_mode == "source":
+                LOGGER.debug("[Harvester] Cycle start: collecting source candidates.")
+                candidates, source_stats, discovery_interrupted = await self._collect_source_candidates(
+                    stop_event,
+                )
+                tmdb_list_request_errors = sum(
+                    int(stat.get("errors") or 0) for stat in source_stats.values()
+                )
+                refresh_local_budget_stats()
+
+            elif self.discovery_mode == "local":
+                LOGGER.debug("[Harvester] Cycle start: collecting local due candidates.")
+                if self.status is not None:
+                    self.status.begin_cycle(sources=[])
+                candidates, local_stats, discovery_interrupted = await self._collect_local_candidates(
+                    stop_event,
+                    day_key=budget_day_key,
+                )
+                refresh_local_budget_stats()
+                if self.status is not None:
+                    self.status.update_local_stats(local_stats)
+                    self.status.update_scan_cap_reached(False)
+                persist_local_cycle_metrics(
+                    extra={"source_due": 0, "source_ran": 0, "source_selected": 0}
+                )
+
+            else:
+                LOGGER.debug("[Harvester] Cycle start: collecting local due candidates (hybrid).")
+                local_candidates, local_stats, local_interrupted = await self._collect_local_candidates(
+                    stop_event,
+                    day_key=budget_day_key,
+                )
+                discovery_interrupted = local_interrupted
+                if self.status is not None:
+                    self.status.update_local_stats(local_stats)
+                source_candidates: List[Candidate] = []
+
+                source_due = self._hybrid_source_due(now_ts)
+                source_ran = False
+
+                if (
+                    not discovery_interrupted
+                    and source_due
+                    and not stop_event.is_set()
+                ):
+                    source_ran = True
+                    source_candidates, source_stats, source_interrupted = await self._collect_source_candidates(
+                        stop_event,
+                    )
+                    tmdb_list_request_errors = sum(
+                        int(stat.get("errors") or 0) for stat in source_stats.values()
+                    )
+                    discovery_interrupted = discovery_interrupted or source_interrupted
+                    if not source_interrupted and not stop_event.is_set():
+                        self.db.set_state(self._hybrid_source_last_run_key, now_epoch())
+                else:
+                    if self.status is not None:
+                        self.status.begin_cycle(sources=self.scan_sources)
+                        self.status.update_scan_cap_reached(False)
+                        configured_total_pages = sum(
+                            max(1, int(source.max_pages)) for source in self.scan_sources
+                        )
+                        self.status.complete_scan(
+                            selected=0,
+                            raw_seen=0,
+                            scanned_pages=0,
+                            total_pages=max(1, configured_total_pages),
+                        )
+
+                candidates = merge_unique_candidates(local_candidates, source_candidates)
+                refresh_local_budget_stats()
+                if self.status is not None:
+                    self.status.update_local_stats(local_stats)
+                persist_local_cycle_metrics(
+                    extra={
+                        "source_due": 1 if source_due else 0,
+                        "source_ran": 1 if source_ran else 0,
+                        "source_selected": len(source_candidates),
+                    }
+                )
+
+            if discovery_interrupted:
                 if candidates:
                     self._save_checkpoint(
                         phase="tmdb_details_pending",
                         candidates=candidates,
                         source_stats=source_stats,
                         tmdb_list_request_errors=tmdb_list_request_errors,
-                        note="stopped during tmdb scan",
+                        local_stats=local_stats,
+                        budget_day_key=budget_day_key,
+                        budget_reserved=budget_reserved,
+                        note=f"stopped during {self.discovery_mode} discovery",
                     )
                 LOGGER.info(
-                    "[Harvester] Stop requested during source scan. Checkpointed %s candidate(s).",
+                    "[Harvester] Stop requested during %s discovery. Checkpointed %s candidate(s).",
+                    self.discovery_mode,
                     len(candidates),
                 )
                 return HarvestCycleResult(
@@ -5818,9 +7060,16 @@ class Harvester:
                     resumed_from_checkpoint=False,
                 )
 
+            persist_local_cycle_metrics()
+
+        refresh_local_budget_stats()
+        if self.status is not None:
+            self.status.update_local_stats(local_stats)
+
         LOGGER.info(
-            "[Harvester] Cycle completed: collected %s source candidates.",
+            "[Harvester] Cycle completed: collected %s candidate(s) (mode=%s).",
             len(candidates),
+            self.discovery_mode,
         )
         if not candidates:
             LOGGER.info("[Harvester] No candidates eligible this cycle.")
@@ -5838,7 +7087,10 @@ class Harvester:
             candidates=candidates,
             source_stats=source_stats,
             tmdb_list_request_errors=tmdb_list_request_errors,
-            note="tmdb scan complete",
+            local_stats=local_stats,
+            budget_day_key=budget_day_key,
+            budget_reserved=budget_reserved,
+            note="candidate discovery complete",
         )
         LOGGER.info(
             "[Harvester] Fetching start: collecting TMDB details."
@@ -5858,6 +7110,9 @@ class Harvester:
                 candidates=candidates,
                 source_stats=source_stats,
                 tmdb_list_request_errors=tmdb_list_request_errors,
+                local_stats=local_stats,
+                budget_day_key=budget_day_key,
+                budget_reserved=budget_reserved,
                 note="stopped during tmdb details",
             )
             LOGGER.info(
@@ -5877,6 +7132,9 @@ class Harvester:
             candidates=candidates,
             source_stats=source_stats,
             tmdb_list_request_errors=tmdb_list_request_errors,
+            local_stats=local_stats,
+            budget_day_key=budget_day_key,
+            budget_reserved=budget_reserved,
             note="tmdb details complete",
         )
         LOGGER.info(
@@ -5919,6 +7177,7 @@ class Harvester:
         queue_added_mappings = 0
         persisted_keys: Set[Tuple[str, int]] = set()
         queue_log_every = max(100, min(2000, len(candidates) // 10 or 100))
+        mdblist_budget_exhausted = False
 
         def on_mdblist_chunk(
             media_type: str,
@@ -5927,15 +7186,42 @@ class Harvester:
             chunk_attempted: Set[int],
             chunk_index: int,
             total_chunks: int,
-        ) -> None:
+        ) -> bool:
             nonlocal enriched
             nonlocal enriched_mdblist_ok
             nonlocal enriched_mdblist_miss
             nonlocal enriched_tmdb_only
             nonlocal queue_added_ratings
             nonlocal queue_added_mappings
+            nonlocal mdblist_budget_exhausted
+
+            allowed_attempted_ids: Set[int] = set(chunk_attempted)
+            if chunk_attempted:
+                consumed = self._consume_daily_budget(budget_day_key, len(chunk_attempted))
+                if consumed < len(chunk_attempted):
+                    mdblist_budget_exhausted = True
+                    if consumed <= 0:
+                        allowed_attempted_ids = set()
+                    else:
+                        allowed_attempted_ids = set()
+                        remaining_slots = consumed
+                        for tmdb_id in chunk_ids:
+                            if tmdb_id not in chunk_attempted:
+                                continue
+                            allowed_attempted_ids.add(tmdb_id)
+                            remaining_slots -= 1
+                            if remaining_slots <= 0:
+                                break
+                refresh_local_budget_stats()
+                if int(local_stats.get("budget_remaining") or 0) <= 0:
+                    mdblist_budget_exhausted = True
+                if self.status is not None:
+                    self.status.update_local_stats(local_stats)
+
             now_ts = now_epoch()
             for tmdb_id in chunk_ids:
+                if tmdb_id in chunk_attempted and tmdb_id not in allowed_attempted_ids:
+                    continue
                 key = (media_type, tmdb_id)
                 if key in persisted_keys:
                     continue
@@ -5991,6 +7277,7 @@ class Harvester:
                     queue_ratings=queue_added_ratings,
                     queue_mappings=queue_added_mappings,
                 )
+            return not mdblist_budget_exhausted
 
         (
             mdblist_data,
@@ -6013,6 +7300,7 @@ class Harvester:
             )
 
         if mdblist_halted or stop_event.is_set():
+            budget_halt = (mdblist_halt_reason or "").strip().lower() == "daily title limit reached"
             remaining_candidates = [
                 candidate
                 for candidate in candidates
@@ -6024,6 +7312,9 @@ class Harvester:
                     candidates=remaining_candidates,
                     source_stats=source_stats,
                     tmdb_list_request_errors=tmdb_list_request_errors,
+                    local_stats=local_stats,
+                    budget_day_key=budget_day_key,
+                    budget_reserved=budget_reserved,
                     note=mdblist_halt_reason or "stopped during mdblist enrichment",
                 )
             else:
@@ -6045,7 +7336,7 @@ class Harvester:
             return HarvestCycleResult(
                 selected_candidates=len(candidates),
                 tmdb_list_request_errors=tmdb_list_request_errors,
-                mdblist_request_failures=1,
+                mdblist_request_failures=0 if budget_halt else 1,
                 interrupted=bool(stop_event.is_set()),
                 resumed_from_checkpoint=resumed_from_checkpoint,
             )
@@ -6698,6 +7989,7 @@ async def run_app(config: Dict[str, Any], logging_runtime: LoggingRuntime) -> No
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     db = LocalDatabase(db_path)
+    harvester: Optional[Harvester] = None
     live_active = False
 
     try:
@@ -6770,6 +8062,7 @@ async def run_app(config: Dict[str, Any], logging_runtime: LoggingRuntime) -> No
             db=db,
             submitter_workers=int(config["runtime"].get("submitter_workers", 8)),
             event_buffer=logging_runtime.event_buffer,
+            discovery_mode=str(config["runtime"].get("discovery_mode", "source")),
             event_lines=int(config["runtime"].get("dashboard_event_lines", 8)),
         )
 
@@ -6806,10 +8099,16 @@ async def run_app(config: Dict[str, Any], logging_runtime: LoggingRuntime) -> No
         LOGGER.info("Database: %s", db_path)
         LOGGER.info("Log file: %s", logging_runtime.log_file_path)
         LOGGER.info(
-            "Starting loops: run_mode=%s, harvest_mode=%s, ratings_refresh_days=%s, enabled_sources=%s, submitter_lease=%ss, submitter_max_retry_attempts=%s",
-            config["runtime"]["run_mode"],
-            config["runtime"]["harvest_mode"],
+            (
+                "Starting loops: discovery_mode=%s, "
+                "ratings_refresh_days=%s, daily_title_limit=%s, hybrid_source_interval_hours=%s, "
+                "failed_refresh_days=%s, enabled_sources=%s, submitter_lease=%ss, submitter_max_retry_attempts=%s"
+            ),
+            config["runtime"].get("discovery_mode", "source"),
             config["runtime"]["ratings_refresh_days"],
+            config["runtime"].get("daily_title_limit", 100000),
+            config["runtime"].get("hybrid_source_interval_hours", 24),
+            config["runtime"].get("failed_refresh_days", 7),
             len([s for s in config["tmdb"]["sources"] if s.get("enabled", True)]),
             config["runtime"].get("submitter_in_flight_lease_seconds", 300),
             config["runtime"].get("submitter_max_retry_attempts", 12),
@@ -6846,7 +8145,7 @@ async def run_app(config: Dict[str, Any], logging_runtime: LoggingRuntime) -> No
                 LOGGER.info("Shutdown complete.")
                 raise exc
 
-        # Normal shutdown path (run_mode stop or signal).
+        # Normal shutdown path (stop signal).
         LOGGER.info("Shutdown: stop requested, waiting for remaining tasks.")
         for p in pending:
             p.cancel()
@@ -6856,6 +8155,8 @@ async def run_app(config: Dict[str, Any], logging_runtime: LoggingRuntime) -> No
     finally:
         if live_active:
             logging_runtime.live_state.set_live_active(False)
+        if harvester is not None:
+            harvester.close()
         db.close()
 
 
