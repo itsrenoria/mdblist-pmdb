@@ -18,18 +18,22 @@ import asyncio
 import copy
 import datetime as dt
 import email.utils
+import gzip
 import json
 import logging
 import math
 import random
+import re
 import signal
 import socket
 import sqlite3
+import shutil
 import threading
 import time
 import warnings
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from decimal import ROUND_HALF_UP, Decimal
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
@@ -61,6 +65,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "runtime": {
         "database_path": "mdblist_pmdb.sqlite3",
+        "imdb_archive_path": "imdb",
+        "imdb_archive_auto_update_enabled": True,
+        "imdb_archive_update_interval_days": 7,
+        "imdb_archive_download_timeout_seconds": 300,
         "log_file_path": "logs/mdblist_pmdb.log",
         "log_file_max_bytes": 10485760,
         "log_file_backup_count": 5,
@@ -100,6 +108,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             {"name": "trending/tv/week", "enabled": True, "max_pages": 500},
             {"name": "trending/all/day", "enabled": True, "max_pages": 500},
             {"name": "trending/all/week", "enabled": True, "max_pages": 500},
+            {
+                "name": "imdb_archive",
+                "enabled": False,
+                "min_votes": 1000,
+                "types": ["movie", "tvSeries", "tvMiniSeries", "tvMovie"],
+                "exclude_unknown_year": True,
+                "max_titles_per_cycle": 10000,
+            },
         ],
     },
     "mdblist": {
@@ -161,6 +177,21 @@ SUPPORTED_TMDB_SOURCE_NAMES: Set[str] = {
     "trending/all/week",
 }
 
+IMDB_ARCHIVE_SOURCE_NAME = "imdb_archive"
+SUPPORTED_IMDB_TITLE_TYPES: Set[str] = {
+    "movie",
+    "tvseries",
+    "tvminiseries",
+    "tvmovie",
+}
+DEFAULT_IMDB_TITLE_TYPES: Tuple[str, ...] = (
+    "movie",
+    "tvSeries",
+    "tvMiniSeries",
+    "tvMovie",
+)
+IMDB_TITLE_ID_RE = re.compile(r"^tt[0-9]+$")
+
 SUPPORTED_HARVEST_MODES: Set[str] = {
     "new_only",
     "failed_only",
@@ -181,6 +212,18 @@ SUPPORTED_CONSOLE_MODES: Set[str] = {
 
 HARVEST_CHECKPOINT_KEY = "harvester_checkpoint_v1"
 RETRY_STORM_CLEANUP_KEY = "submitter_retry_storm_cleanup_v1"
+IMDB_ARCHIVE_FINGERPRINT_KEY = "imdb_archive_fingerprint_v1"
+IMDB_ARCHIVE_CURSOR_LINE_KEY = "imdb_archive_cursor_line_v1"
+IMDB_ARCHIVE_CURSOR_BYTE_KEY = "imdb_archive_cursor_byte_v1"
+IMDB_ARCHIVE_TOTAL_KEY = "imdb_archive_total_v1"
+IMDB_ARCHIVE_EXHAUSTED_KEY = "imdb_archive_exhausted_v1"
+IMDB_ARCHIVE_LAST_UPDATE_KEY = "imdb_archive_last_update_v1"
+IMDB_ARCHIVE_LAST_UPDATE_ATTEMPT_KEY = "imdb_archive_last_update_attempt_v1"
+IMDB_ARCHIVE_RETRY_COOLDOWN_SECONDS = 21600  # 6 hours
+IMDB_ARCHIVE_DATASET_URLS: Dict[str, str] = {
+    "title.basics.tsv": "https://datasets.imdbws.com/title.basics.tsv.gz",
+    "title.ratings.tsv": "https://datasets.imdbws.com/title.ratings.tsv.gz",
+}
 
 
 def now_epoch() -> int:
@@ -207,6 +250,30 @@ def parse_int(value: Any) -> Optional[int]:
         return None
 
 
+def is_valid_imdb_title_id(value: Any) -> bool:
+    if value is None:
+        return False
+    return IMDB_TITLE_ID_RE.match(str(value).strip()) is not None
+
+
+def normalize_imdb_title_id(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    candidate = str(value).strip()
+    if not candidate:
+        return None
+    return candidate if is_valid_imdb_title_id(candidate) else None
+
+
+def imdb_title_type_to_media_type(title_type: str) -> Optional[str]:
+    lowered = str(title_type or "").strip().lower()
+    if lowered in {"movie", "tvmovie"}:
+        return "movie"
+    if lowered in {"tvseries", "tvminiseries"}:
+        return "tv"
+    return None
+
+
 def clamp_0_100(value: float) -> Optional[float]:
     if value is None:
         return None
@@ -214,7 +281,20 @@ def clamp_0_100(value: float) -> Optional[float]:
         return None
     if value <= 0:
         return None
-    return round(min(100.0, max(0.0, value)), 1)
+    bounded = min(100.0, max(0.0, value))
+    rounded = Decimal(str(bounded)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    return float(rounded)
+
+
+def score_to_tenths(value: Any) -> Optional[int]:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    normalized = clamp_0_100(numeric)
+    if normalized is None:
+        return None
+    return int(round(normalized * 10.0))
 
 
 def parse_retry_after(value: Optional[str], default_seconds: int = 5) -> int:
@@ -372,6 +452,18 @@ def load_config(path: Path) -> Dict[str, Any]:
     config["runtime"]["debug_raw_console_logs"] = bool(
         config["runtime"].get("debug_raw_console_logs", False)
     )
+    config["runtime"]["imdb_archive_path"] = str(
+        config["runtime"].get("imdb_archive_path", "")
+    ).strip()
+    config["runtime"]["imdb_archive_auto_update_enabled"] = bool(
+        config["runtime"].get("imdb_archive_auto_update_enabled", True)
+    )
+    config["runtime"]["imdb_archive_update_interval_days"] = max(
+        1, int(config["runtime"].get("imdb_archive_update_interval_days", 7))
+    )
+    config["runtime"]["imdb_archive_download_timeout_seconds"] = max(
+        30, int(config["runtime"].get("imdb_archive_download_timeout_seconds", 300))
+    )
 
     harvest_mode = str(config["runtime"].get("harvest_mode", "all")).strip().lower()
     if harvest_mode not in SUPPORTED_HARVEST_MODES:
@@ -424,21 +516,63 @@ def load_config(path: Path) -> Dict[str, Any]:
     if not isinstance(raw_sources, list) or not raw_sources:
         raise ValueError("tmdb.sources must be a non-empty list")
 
-    normalized_sources: List[Dict[str, Any]] = []
+    normalized_tmdb_sources: List[Dict[str, Any]] = []
+    normalized_imdb_sources: List[Dict[str, Any]] = []
     for idx, source in enumerate(raw_sources):
         if not isinstance(source, dict):
             raise ValueError(f"tmdb.sources[{idx}] must be an object")
 
         name = str(source.get("name", "")).strip().lower().lstrip("/")
+        if name == IMDB_ARCHIVE_SOURCE_NAME:
+            enabled = bool(source.get("enabled", True))
+            min_votes = max(0, int(source.get("min_votes", 1000)))
+            max_titles_per_cycle = max(1, int(source.get("max_titles_per_cycle", 10000)))
+            exclude_unknown_year = bool(source.get("exclude_unknown_year", True))
+
+            raw_types = source.get("types", list(DEFAULT_IMDB_TITLE_TYPES))
+            if not isinstance(raw_types, list) or not raw_types:
+                raise ValueError(
+                    f"tmdb.sources[{idx}].types must be a non-empty list for imdb_archive"
+                )
+            normalized_types: List[str] = []
+            for raw_type in raw_types:
+                lowered_type = str(raw_type or "").strip().lower()
+                if lowered_type not in SUPPORTED_IMDB_TITLE_TYPES:
+                    raise ValueError(
+                        f"tmdb.sources[{idx}].types contains unsupported value '{raw_type}'. "
+                        f"Supported values: movie, tvSeries, tvMiniSeries, tvMovie"
+                    )
+                canonical_type = {
+                    "movie": "movie",
+                    "tvseries": "tvSeries",
+                    "tvminiseries": "tvMiniSeries",
+                    "tvmovie": "tvMovie",
+                }[lowered_type]
+                if canonical_type not in normalized_types:
+                    normalized_types.append(canonical_type)
+
+            normalized_imdb_sources.append(
+                {
+                    "name": IMDB_ARCHIVE_SOURCE_NAME,
+                    "enabled": enabled,
+                    "min_votes": min_votes,
+                    "types": normalized_types,
+                    "exclude_unknown_year": exclude_unknown_year,
+                    "max_titles_per_cycle": max_titles_per_cycle,
+                }
+            )
+            continue
+
         if name not in SUPPORTED_TMDB_SOURCE_NAMES:
             raise ValueError(
                 f"tmdb.sources[{idx}].name='{name}' is unsupported. "
-                f"Supported values: {', '.join(sorted(SUPPORTED_TMDB_SOURCE_NAMES))}"
+                f"Supported values: {', '.join(sorted(SUPPORTED_TMDB_SOURCE_NAMES))}, "
+                f"{IMDB_ARCHIVE_SOURCE_NAME}"
             )
 
         enabled = bool(source.get("enabled", True))
         max_pages = max(1, min(500, int(source.get("max_pages", 500))))
-        normalized_sources.append(
+        normalized_tmdb_sources.append(
             {
                 "name": name,
                 "enabled": enabled,
@@ -446,8 +580,21 @@ def load_config(path: Path) -> Dict[str, Any]:
             }
         )
 
+    if len(normalized_imdb_sources) > 1:
+        raise ValueError("Only one tmdb.sources entry with name='imdb_archive' is supported")
+
+    normalized_sources = normalized_tmdb_sources + normalized_imdb_sources
     if not any(src["enabled"] for src in normalized_sources):
         raise ValueError("At least one tmdb.sources entry must be enabled")
+
+    imdb_enabled = any(
+        src["enabled"] and src["name"] == IMDB_ARCHIVE_SOURCE_NAME
+        for src in normalized_sources
+    )
+    if imdb_enabled and not config["runtime"]["imdb_archive_path"]:
+        raise ValueError(
+            "runtime.imdb_archive_path is required when tmdb.sources includes enabled imdb_archive"
+        )
 
     config["tmdb"]["sources"] = normalized_sources
 
@@ -480,6 +627,25 @@ class TMDBSource:
     endpoint: str
     media_type_hint: Optional[str]
     max_pages: int
+
+
+@dataclass
+class IMDbArchiveSource:
+    name: str
+    min_votes: int
+    types: Tuple[str, ...]
+    exclude_unknown_year: bool
+    max_titles_per_cycle: int
+    path: Path
+    max_pages: int = 1
+
+
+@dataclass
+class IMDbArchiveCandidate:
+    imdb_id: str
+    media_type: str
+    num_votes: int
+    average_rating: Optional[float]
 
 
 @dataclass
@@ -923,9 +1089,10 @@ class LocalDatabase:
             "SELECT * FROM titles WHERE tmdb_id = ? AND media_type = ?",
             (tmdb_id, media_type),
         ).fetchone()
+        normalized_incoming_imdb = normalize_imdb_title_id(imdb_id)
 
         if existing:
-            final_imdb = imdb_id or existing["imdb_id"]
+            final_imdb = normalized_incoming_imdb or normalize_imdb_title_id(existing["imdb_id"])
             final_last_mdblist = now_ts
 
             self.conn.execute(
@@ -975,7 +1142,7 @@ class LocalDatabase:
                 tmdb_id,
                 media_type,
                 title,
-                imdb_id,
+                normalized_incoming_imdb,
                 popularity,
                 tmdb_vote_average,
                 now_ts,
@@ -1024,7 +1191,12 @@ class LocalDatabase:
             )
             return True
 
-        score_changed = abs(float(existing["score"]) - score) > 0.01
+        existing_tenths = score_to_tenths(existing["score"])
+        new_tenths = score_to_tenths(score)
+        if existing_tenths is None or new_tenths is None:
+            score_changed = True
+        else:
+            score_changed = existing_tenths != new_tenths
         previous_status = str(existing["pmdb_status"])
 
         if score_changed or previous_status in {"failed", "retry"}:
@@ -1063,6 +1235,12 @@ class LocalDatabase:
         id_value: str,
         fetched_at: int,
     ) -> bool:
+        if id_type == "imdb":
+            normalized_imdb = normalize_imdb_title_id(id_value)
+            if not normalized_imdb:
+                return False
+            id_value = normalized_imdb
+
         existing = self.conn.execute(
             """
             SELECT id_value, pmdb_status, pmdb_item_id
@@ -2175,8 +2353,9 @@ def extract_mappings(
         (mdblist_item or {}).get("imdb_id"),
         (mdblist_item or {}).get("imdbid"),
     )
-    if imdb_id:
-        mappings["imdb"] = imdb_id
+    normalized_imdb = normalize_imdb_title_id(imdb_id)
+    if normalized_imdb:
+        mappings["imdb"] = normalized_imdb
 
     tvdb_id = first_non_empty(
         tmdb_external.get("tvdb_id"),
@@ -2285,6 +2464,20 @@ class TMDBClient:
                 "api_key": self.api_key,
                 "language": self.language,
                 "append_to_response": "external_ids",
+            },
+            gate=self.gate,
+        )
+
+    async def fetch_find_by_imdb(self, imdb_id: str) -> APIResponse:
+        safe_imdb_id = str(imdb_id or "").strip()
+        url = f"{self.base_url}/find/{safe_imdb_id}"
+        return await self.http.request_json(
+            method="GET",
+            url=url,
+            params={
+                "api_key": self.api_key,
+                "language": self.language,
+                "external_source": "imdb_id",
             },
             gate=self.gate,
         )
@@ -2937,12 +3130,11 @@ class PMDBClient:
 
     @staticmethod
     def _rating_entry_matches_score(entry: Dict[str, Any], score: float) -> bool:
-        existing_score = entry.get("score")
-        try:
-            existing_numeric = float(existing_score)
-        except (TypeError, ValueError):
+        existing_tenths = score_to_tenths(entry.get("score"))
+        target_tenths = score_to_tenths(score)
+        if existing_tenths is None or target_tenths is None:
             return False
-        return abs(existing_numeric - score) <= 0.1
+        return existing_tenths == target_tenths
 
     @staticmethod
     def _mapping_entry_matches_value(entry: Dict[str, Any], id_value: str) -> bool:
@@ -3143,14 +3335,13 @@ class PMDBClient:
             endpoint="/api/external/ratings",
         )
 
-    async def _replace_mapping_after_duplicate(
+    async def _resolve_mapping_duplicate_or_conflict(
         self,
         *,
         tmdb_id: int,
         media_type: str,
         id_type: str,
         id_value: str,
-        known_item_id: Optional[str],
     ) -> PMDBSubmitResult:
         lookup = await self._fetch_existing_mappings(tmdb_id, media_type)
         if lookup.status in (429, 500, 502, 503, 504, 0):
@@ -3191,51 +3382,7 @@ class PMDBClient:
             )
 
         entries = self._extract_mappings_for_type(lookup.data, id_type)
-        candidate_ids: List[str] = []
-        if known_item_id:
-            candidate_ids.append(known_item_id)
-        for entry in entries:
-            entry_id = self._extract_entry_id(entry)
-            if entry_id and entry_id not in candidate_ids:
-                candidate_ids.append(entry_id)
-
-        deleted_any = False
-        for entry_id in candidate_ids:
-            delete_result = await self._delete_mapping_by_id(entry_id)
-            if delete_result.retryable:
-                return PMDBSubmitResult(
-                    success=False,
-                    retryable=True,
-                    retry_after_seconds=delete_result.retry_after_seconds,
-                    duplicate_or_exists=False,
-                    error_text=delete_result.error_text,
-                    item_id=None,
-                    status_code=delete_result.status_code,
-                    error_code=delete_result.error_code,
-                    endpoint=delete_result.endpoint or "/api/external/mappings",
-                )
-            if delete_result.success:
-                deleted_any = True
-
-        if deleted_any:
-            retry_response = await self._post_with_gates(
-                url=f"{self.base_url}/api/external/mappings",
-                payload={
-                    "tmdb_id": tmdb_id,
-                    "media_type": media_type,
-                    "id_type": id_type,
-                    "id_value": id_value,
-                },
-                contribution_gate=self.mapping_gate,
-            )
-            retry_result = self._to_submit_result(
-                retry_response,
-                endpoint="/api/external/mappings",
-            )
-            if retry_result.success:
-                return retry_result
-
-        # If the exact mapping exists remotely, avoid retry loops.
+        # If the exact mapping exists remotely, treat conflict/duplicate as success.
         for entry in entries:
             if self._mapping_entry_matches_value(entry, id_value):
                 return PMDBSubmitResult(
@@ -3250,31 +3397,18 @@ class PMDBClient:
                     endpoint="/api/external/mappings",
                 )
 
-        if candidate_ids and not deleted_any:
-            return PMDBSubmitResult(
-                success=False,
-                retryable=False,
-                retry_after_seconds=0,
-                duplicate_or_exists=False,
-                error_text=(
-                    "PMDB has existing mapping entry for this id_type but it could not be "
-                    "deleted with the current API key."
-                ),
-                item_id=None,
-                status_code=409,
-                error_code="conflict_not_owned",
-                endpoint="/api/external/mappings",
-            )
-
         return PMDBSubmitResult(
             success=False,
             retryable=False,
             retry_after_seconds=0,
             duplicate_or_exists=False,
-            error_text="PMDB mapping create failed and no replace target was found.",
+            error_text=(
+                "PMDB reported duplicate/conflict for mapping create, but exact mapping "
+                "was not found during confirmation."
+            ),
             item_id=None,
-            status_code=500,
-            error_code="create_failed_unresolved",
+            status_code=409,
+            error_code="duplicate_unresolved",
             endpoint="/api/external/mappings",
         )
 
@@ -3339,25 +3473,7 @@ class PMDBClient:
         media_type: str,
         id_type: str,
         id_value: str,
-        existing_pmdb_item_id: Optional[str] = None,
     ) -> PMDBSubmitResult:
-        if existing_pmdb_item_id:
-            delete_result = await self._delete_mapping_by_id(existing_pmdb_item_id)
-            if not delete_result.success:
-                return PMDBSubmitResult(
-                    success=False,
-                    retryable=delete_result.retryable,
-                    retry_after_seconds=delete_result.retry_after_seconds
-                    if delete_result.retryable
-                    else 0,
-                    duplicate_or_exists=False,
-                    error_text=delete_result.error_text,
-                    item_id=None,
-                    status_code=delete_result.status_code,
-                    error_code=delete_result.error_code,
-                    endpoint=delete_result.endpoint or "/api/external/mappings",
-                )
-
         response = await self._post_with_gates(
             url=f"{self.base_url}/api/external/mappings",
             payload={
@@ -3376,12 +3492,11 @@ class PMDBClient:
             self._is_create_failed_mapping(result)
             or self._is_duplicate_or_exists_result(result)
         ):
-            resolved = await self._replace_mapping_after_duplicate(
+            resolved = await self._resolve_mapping_duplicate_or_conflict(
                 tmdb_id=tmdb_id,
                 media_type=media_type,
                 id_type=id_type,
                 id_value=id_value,
-                known_item_id=existing_pmdb_item_id,
             )
             return resolved
         return result
@@ -3431,6 +3546,11 @@ class RuntimeDashboard:
         self.details_ok = 0
         self.details_failed = 0
         self.details_started_at = 0
+        self.imdb_map_total = 0
+        self.imdb_map_done = 0
+        self.imdb_map_ok = 0
+        self.imdb_map_missing = 0
+        self.imdb_map_errors = 0
 
         self.md_movie_batches_total = 0
         self.md_movie_batches_done = 0
@@ -3498,9 +3618,9 @@ class RuntimeDashboard:
     def set_submitter_workers(self, workers: int) -> None:
         self.submitter_workers = max(1, int(workers))
 
-    def begin_cycle(self, *, sources: Sequence[TMDBSource]) -> None:
+    def begin_cycle(self, *, sources: Sequence[Any]) -> None:
         self.cycle_index += 1
-        self.phase = "TMDB candidate scan"
+        self.phase = "Candidate scan"
         self.cycle_started_at = now_epoch()
         self._ratings_queue_peak = 0
         self._mappings_queue_peak = 0
@@ -3537,6 +3657,11 @@ class RuntimeDashboard:
         self.details_ok = 0
         self.details_failed = 0
         self.details_started_at = 0
+        self.imdb_map_total = 0
+        self.imdb_map_done = 0
+        self.imdb_map_ok = 0
+        self.imdb_map_missing = 0
+        self.imdb_map_errors = 0
 
         self.md_movie_batches_total = 0
         self.md_movie_batches_done = 0
@@ -3651,6 +3776,26 @@ class RuntimeDashboard:
         self.details_ok = 0
         self.details_failed = 0
         self.details_started_at = now_epoch()
+
+    def begin_imdb_mapping(self, *, total: int) -> None:
+        self.imdb_map_total = max(0, int(total))
+        self.imdb_map_done = 0
+        self.imdb_map_ok = 0
+        self.imdb_map_missing = 0
+        self.imdb_map_errors = 0
+
+    def update_imdb_mapping(
+        self,
+        *,
+        done: int,
+        ok: int,
+        missing: int,
+        errors: int,
+    ) -> None:
+        self.imdb_map_done = max(0, int(done))
+        self.imdb_map_ok = max(0, int(ok))
+        self.imdb_map_missing = max(0, int(missing))
+        self.imdb_map_errors = max(0, int(errors))
 
     def update_tmdb_details(
         self,
@@ -3890,7 +4035,7 @@ class RuntimeDashboard:
             else 0.0
         )
         table.add_row(
-            "TMDB scan",
+            "Source scan",
             self._render_bar(self.scan_pages_total, self.scan_pages_done),
             (
                 f"p={int(self.scan_pages_done)}/{int(self.scan_pages_total)} "
@@ -3928,6 +4073,32 @@ class RuntimeDashboard:
                     f"seen={int(source_seen)} "
                     f"err={int(source_errors)} "
                     f"elig={source_eligibility:.2f}%"
+                ),
+            )
+
+        show_imdb_map_row = (
+            IMDB_ARCHIVE_SOURCE_NAME in self.scan_source_stats
+            or self.imdb_map_total > 0
+            or self.imdb_map_done > 0
+            or self.imdb_map_ok > 0
+            or self.imdb_map_missing > 0
+            or self.imdb_map_errors > 0
+        )
+        if show_imdb_map_row:
+            imdb_map_success = (
+                (self.imdb_map_ok / self.imdb_map_done) * 100.0
+                if self.imdb_map_done > 0
+                else 0.0
+            )
+            table.add_row(
+                "IMDb->TMDB map",
+                self._render_bar(self.imdb_map_total, self.imdb_map_done),
+                (
+                    f"{int(self.imdb_map_done)}/{int(self.imdb_map_total)} "
+                    f"ok={int(self.imdb_map_ok)} "
+                    f"miss={int(self.imdb_map_missing)} "
+                    f"err={int(self.imdb_map_errors)} "
+                    f"suc={imdb_map_success:.2f}%"
                 ),
             )
 
@@ -4291,16 +4462,630 @@ class Harvester:
         self.ratings_ttl_seconds = int(config["runtime"]["ratings_refresh_days"]) * 86400
         self.harvest_mode = str(config["runtime"]["harvest_mode"]).strip().lower()
         self.run_mode = str(config["runtime"].get("run_mode", "continuous")).strip().lower()
+        self.imdb_archive_auto_update_enabled = bool(
+            config["runtime"].get("imdb_archive_auto_update_enabled", True)
+        )
+        self.imdb_archive_update_interval_seconds = (
+            max(1, int(config["runtime"].get("imdb_archive_update_interval_days", 7)))
+            * 86400
+        )
+        self.imdb_archive_download_timeout_seconds = max(
+            30, int(config["runtime"].get("imdb_archive_download_timeout_seconds", 300))
+        )
 
         self.cycle_sleep_seconds = int(config["runtime"]["harvester_cycle_sleep_seconds"])
 
         self.details_concurrency = int(config["tmdb"]["details_concurrency"])
-        self.sources: List[TMDBSource] = [
+        self.tmdb_sources: List[TMDBSource] = [
             self.tmdb_client.build_source(entry)
             for entry in config["tmdb"]["sources"]
             if bool(entry.get("enabled", True))
+            and str(entry.get("name", "")).strip().lower().lstrip("/")
+            != IMDB_ARCHIVE_SOURCE_NAME
         ]
+        self.imdb_archive_source: Optional[IMDbArchiveSource] = None
+        imdb_path = Path(str(config["runtime"].get("imdb_archive_path", "")).strip()).expanduser()
+        for entry in config["tmdb"]["sources"]:
+            name = str(entry.get("name", "")).strip().lower().lstrip("/")
+            if name != IMDB_ARCHIVE_SOURCE_NAME or not bool(entry.get("enabled", True)):
+                continue
+            self.imdb_archive_source = IMDbArchiveSource(
+                name=IMDB_ARCHIVE_SOURCE_NAME,
+                min_votes=max(0, int(entry.get("min_votes", 1000))),
+                types=tuple(entry.get("types") or list(DEFAULT_IMDB_TITLE_TYPES)),
+                exclude_unknown_year=bool(entry.get("exclude_unknown_year", True)),
+                max_titles_per_cycle=max(1, int(entry.get("max_titles_per_cycle", 10000))),
+                path=imdb_path,
+            )
+            break
+        self.scan_sources: List[Any] = list(self.tmdb_sources)
+        if self.imdb_archive_source is not None:
+            self.scan_sources.append(self.imdb_archive_source)
+
+        self._imdb_index_path = (
+            self.db.path.parent / "temp" / "imdb_archive_candidates_v1.tsv"
+        )
+        self._imdb_index_path.parent.mkdir(parents=True, exist_ok=True)
+        self._imdb_fingerprint_key = IMDB_ARCHIVE_FINGERPRINT_KEY
+        self._imdb_cursor_line_key = IMDB_ARCHIVE_CURSOR_LINE_KEY
+        self._imdb_cursor_byte_key = IMDB_ARCHIVE_CURSOR_BYTE_KEY
+        self._imdb_total_key = IMDB_ARCHIVE_TOTAL_KEY
+        self._imdb_exhausted_key = IMDB_ARCHIVE_EXHAUSTED_KEY
+        self._imdb_last_update_key = IMDB_ARCHIVE_LAST_UPDATE_KEY
+        self._imdb_last_update_attempt_key = IMDB_ARCHIVE_LAST_UPDATE_ATTEMPT_KEY
         self._checkpoint_key = HARVEST_CHECKPOINT_KEY
+
+    def _reset_imdb_cursor(self, *, exhausted: bool = False) -> None:
+        self.db.set_state(self._imdb_cursor_line_key, 0)
+        self.db.set_state(self._imdb_cursor_byte_key, 0)
+        self.db.set_state(self._imdb_exhausted_key, 1 if exhausted else 0)
+
+    def _commit_imdb_cursor(self, *, cursor_line: int, cursor_byte: int, exhausted: bool) -> None:
+        self.db.set_state(self._imdb_cursor_line_key, max(0, int(cursor_line)))
+        self.db.set_state(self._imdb_cursor_byte_key, max(0, int(cursor_byte)))
+        self.db.set_state(self._imdb_exhausted_key, 1 if exhausted else 0)
+
+    def _build_imdb_fingerprint(
+        self,
+        source: IMDbArchiveSource,
+    ) -> Tuple[str, Path, Path]:
+        ratings_path = source.path / "title.ratings.tsv"
+        basics_path = source.path / "title.basics.tsv"
+        if not ratings_path.exists():
+            raise FileNotFoundError(f"IMDb ratings file missing: {ratings_path}")
+        if not basics_path.exists():
+            raise FileNotFoundError(f"IMDb basics file missing: {basics_path}")
+
+        ratings_stat = ratings_path.stat()
+        basics_stat = basics_path.stat()
+        payload = {
+            "ratings": {
+                "path": str(ratings_path.resolve()),
+                "size": int(ratings_stat.st_size),
+                "mtime_ns": int(ratings_stat.st_mtime_ns),
+            },
+            "basics": {
+                "path": str(basics_path.resolve()),
+                "size": int(basics_stat.st_size),
+                "mtime_ns": int(basics_stat.st_mtime_ns),
+            },
+            "source": {
+                "min_votes": int(source.min_votes),
+                "types": list(source.types),
+                "exclude_unknown_year": bool(source.exclude_unknown_year),
+            },
+        }
+        return json.dumps(payload, sort_keys=True, separators=(",", ":")), ratings_path, basics_path
+
+    @staticmethod
+    def _safe_unlink(path: Path) -> None:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+        except Exception:
+            return
+
+    @staticmethod
+    def _file_created_epoch(path: Path) -> Optional[int]:
+        try:
+            stat_result = path.stat()
+        except Exception:
+            return None
+        created_value = getattr(stat_result, "st_birthtime", None)
+        if created_value is None:
+            return None
+        try:
+            created_int = int(created_value)
+        except (TypeError, ValueError):
+            return None
+        return created_int if created_int > 0 else None
+
+    def _download_and_extract_imdb_dataset(
+        self,
+        *,
+        dataset_name: str,
+        url: str,
+        gz_tmp_path: Path,
+        tsv_tmp_path: Path,
+    ) -> None:
+        with requests.get(url, stream=True, timeout=self.imdb_archive_download_timeout_seconds) as resp:
+            resp.raise_for_status()
+            with gz_tmp_path.open("wb") as gz_out:
+                for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        gz_out.write(chunk)
+
+        with gzip.open(gz_tmp_path, "rb") as gz_in, tsv_tmp_path.open("wb") as tsv_out:
+            shutil.copyfileobj(gz_in, tsv_out, length=1024 * 1024)
+
+        if tsv_tmp_path.stat().st_size <= 0:
+            raise ValueError(f"Downloaded IMDb dataset is empty after extraction: {dataset_name}")
+
+    def _extract_local_imdb_gz_if_needed(
+        self,
+        *,
+        dataset_name: str,
+        archive_dir: Path,
+        now_ts: int,
+        max_age_seconds: int,
+    ) -> bool:
+        tsv_path = archive_dir / dataset_name
+        if tsv_path.exists():
+            return False
+        gz_path = archive_dir / f"{dataset_name}.gz"
+        if not gz_path.exists():
+            return False
+        created_at = self._file_created_epoch(gz_path)
+        if created_at is None:
+            LOGGER.info(
+                "[IMDbArchive] Skipping local %s extraction: .gz creation time unavailable.",
+                dataset_name,
+            )
+            return False
+        age_seconds = max(0, int(now_ts - created_at))
+        if age_seconds > max_age_seconds:
+            LOGGER.info(
+                "[IMDbArchive] Skipping local %s extraction: .gz is stale (%ss old > %ss).",
+                dataset_name,
+                age_seconds,
+                max_age_seconds,
+            )
+            return False
+
+        tsv_tmp_path = archive_dir / f".{dataset_name}.extract.tmp"
+        self._safe_unlink(tsv_tmp_path)
+        try:
+            with gzip.open(gz_path, "rb") as gz_in, tsv_tmp_path.open("wb") as tsv_out:
+                shutil.copyfileobj(gz_in, tsv_out, length=1024 * 1024)
+            if tsv_tmp_path.stat().st_size <= 0:
+                raise ValueError(f"Extracted IMDb TSV is empty: {dataset_name}")
+            tsv_tmp_path.replace(tsv_path)
+            # Keep archive directory tidy: remove consumed .gz after extraction.
+            self._safe_unlink(gz_path)
+            LOGGER.info(
+                "[IMDbArchive] Extracted local dataset %s from %s",
+                dataset_name,
+                gz_path.name,
+            )
+            return True
+        except Exception:
+            self._safe_unlink(tsv_tmp_path)
+            return False
+
+    def _refresh_imdb_archives_if_due(self, source: IMDbArchiveSource) -> None:
+        archive_dir = source.path
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.imdb_archive_auto_update_enabled:
+            return
+
+        now_ts = now_epoch()
+        required_tsv_paths = [archive_dir / dataset for dataset in IMDB_ARCHIVE_DATASET_URLS]
+        missing_files = [path for path in required_tsv_paths if not path.exists()]
+        if missing_files:
+            for dataset_name in IMDB_ARCHIVE_DATASET_URLS:
+                self._extract_local_imdb_gz_if_needed(
+                    dataset_name=dataset_name,
+                    archive_dir=archive_dir,
+                    now_ts=now_ts,
+                    max_age_seconds=self.imdb_archive_update_interval_seconds,
+                )
+            missing_files = [path for path in required_tsv_paths if not path.exists()]
+
+        update_due = bool(missing_files)
+        if not update_due:
+            created_values = [
+                self._file_created_epoch(path) for path in required_tsv_paths
+            ]
+            if any(value is None for value in created_values):
+                LOGGER.warning(
+                    "[IMDbArchive] Auto-update skipped: file creation time is unavailable for one or more TSV files."
+                )
+                return
+            created_at_reference = min(
+                int(value) for value in created_values if value is not None
+            )
+            update_due = (
+                now_ts - created_at_reference >= self.imdb_archive_update_interval_seconds
+            )
+        if not update_due:
+            return
+
+        last_attempt = max(0, self.db.get_state_int(self._imdb_last_update_attempt_key, 0))
+        if (
+            not missing_files
+            and last_attempt > 0
+            and now_ts - last_attempt < IMDB_ARCHIVE_RETRY_COOLDOWN_SECONDS
+        ):
+            retry_in = IMDB_ARCHIVE_RETRY_COOLDOWN_SECONDS - (now_ts - last_attempt)
+            LOGGER.info(
+                "[IMDbArchive] Auto-update recently attempted; skipping for %ss.",
+                max(1, retry_in),
+            )
+            return
+
+        self.db.set_state(self._imdb_last_update_attempt_key, now_ts)
+        LOGGER.info(
+            "[IMDbArchive] Auto-update started (interval=%sd, path=%s).",
+            max(1, self.imdb_archive_update_interval_seconds // 86400),
+            archive_dir,
+        )
+
+        staging: List[Tuple[Path, Path, str]] = []
+        staged_paths: List[Path] = []
+        try:
+            for dataset_name, url in IMDB_ARCHIVE_DATASET_URLS.items():
+                tsv_final_path = archive_dir / dataset_name
+                tsv_tmp_path = archive_dir / f".{dataset_name}.download.tmp"
+                gz_tmp_path = archive_dir / f".{dataset_name}.gz.download.tmp"
+                self._safe_unlink(tsv_tmp_path)
+                self._safe_unlink(gz_tmp_path)
+
+                LOGGER.info("[IMDbArchive] Downloading %s", url)
+                self._download_and_extract_imdb_dataset(
+                    dataset_name=dataset_name,
+                    url=url,
+                    gz_tmp_path=gz_tmp_path,
+                    tsv_tmp_path=tsv_tmp_path,
+                )
+                # After extraction, drop the compressed artifact.
+                self._safe_unlink(gz_tmp_path)
+                staged_paths.append(tsv_tmp_path)
+                staging.append(
+                    (
+                        tsv_tmp_path,
+                        tsv_final_path,
+                        dataset_name,
+                    )
+                )
+
+            for tsv_tmp_path, tsv_final_path, _dataset_name in staging:
+                tsv_tmp_path.replace(tsv_final_path)
+            for dataset_name in IMDB_ARCHIVE_DATASET_URLS:
+                # Cleanup old compressed snapshots after successful refresh.
+                self._safe_unlink(archive_dir / f"{dataset_name}.gz")
+
+            self.db.set_state(self._imdb_last_update_key, now_ts)
+            LOGGER.info(
+                "[IMDbArchive] Auto-update completed: %s dataset(s) refreshed.",
+                len(staging),
+            )
+        except Exception as exc:
+            for tmp_path in staged_paths:
+                self._safe_unlink(tmp_path)
+            for dataset_name in IMDB_ARCHIVE_DATASET_URLS:
+                self._safe_unlink(archive_dir / f".{dataset_name}.download.tmp")
+                self._safe_unlink(archive_dir / f".{dataset_name}.gz.download.tmp")
+
+            still_missing = [path for path in required_tsv_paths if not path.exists()]
+            if still_missing:
+                raise RuntimeError(
+                    f"IMDb auto-update failed and required files are missing: {still_missing}"
+                ) from exc
+            LOGGER.warning(
+                "[IMDbArchive] Auto-update failed; using existing local files. reason=%s",
+                exc,
+            )
+
+    def _rebuild_imdb_index(
+        self,
+        *,
+        source: IMDbArchiveSource,
+        ratings_path: Path,
+        basics_path: Path,
+        fingerprint: str,
+    ) -> int:
+        started_at = now_epoch()
+        allowed_types = {str(x or "").strip().lower() for x in source.types}
+        allowed_media_by_imdb: Dict[str, str] = {}
+
+        with basics_path.open("r", encoding="utf-8", errors="replace") as handle:
+            header = handle.readline().rstrip("\n").split("\t")
+            header_map = {name: idx for idx, name in enumerate(header)}
+            tconst_idx = header_map.get("tconst")
+            type_idx = header_map.get("titleType")
+            start_year_idx = header_map.get("startYear")
+            if tconst_idx is None or type_idx is None or start_year_idx is None:
+                raise ValueError("IMDb basics header is missing required columns")
+
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if max(tconst_idx, type_idx, start_year_idx) >= len(parts):
+                    continue
+                imdb_id = str(parts[tconst_idx]).strip()
+                if not is_valid_imdb_title_id(imdb_id):
+                    continue
+                title_type = str(parts[type_idx]).strip().lower()
+                if title_type not in allowed_types:
+                    continue
+                if source.exclude_unknown_year and str(parts[start_year_idx]).strip() == "\\N":
+                    continue
+                media_type = imdb_title_type_to_media_type(title_type)
+                if media_type is None:
+                    continue
+                allowed_media_by_imdb[imdb_id] = media_type
+
+        ranked: List[Tuple[int, str, str, Optional[float]]] = []
+        with ratings_path.open("r", encoding="utf-8", errors="replace") as handle:
+            header = handle.readline().rstrip("\n").split("\t")
+            header_map = {name: idx for idx, name in enumerate(header)}
+            tconst_idx = header_map.get("tconst")
+            avg_idx = header_map.get("averageRating")
+            votes_idx = header_map.get("numVotes")
+            if tconst_idx is None or avg_idx is None or votes_idx is None:
+                raise ValueError("IMDb ratings header is missing required columns")
+
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if max(tconst_idx, avg_idx, votes_idx) >= len(parts):
+                    continue
+                imdb_id = str(parts[tconst_idx]).strip()
+                media_type = allowed_media_by_imdb.get(imdb_id)
+                if media_type is None:
+                    continue
+                votes = parse_int(parts[votes_idx])
+                if votes is None or votes < source.min_votes:
+                    continue
+                average_rating: Optional[float] = None
+                raw_avg = str(parts[avg_idx]).strip()
+                if raw_avg and raw_avg != "\\N":
+                    try:
+                        average_rating = float(raw_avg)
+                    except (TypeError, ValueError):
+                        average_rating = None
+                ranked.append((votes, imdb_id, media_type, average_rating))
+
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        with self._imdb_index_path.open("w", encoding="utf-8") as handle:
+            for votes, imdb_id, media_type, average_rating in ranked:
+                avg_text = "" if average_rating is None else f"{average_rating:.1f}"
+                handle.write(f"{imdb_id}\t{media_type}\t{votes}\t{avg_text}\n")
+
+        total = len(ranked)
+        self.db.set_state(self._imdb_fingerprint_key, fingerprint)
+        self.db.set_state(self._imdb_total_key, total)
+        self._reset_imdb_cursor(exhausted=(total == 0))
+        elapsed = max(1, now_epoch() - started_at)
+        LOGGER.info(
+            "[IMDbArchive] Rebuilt ranked index: total=%s path=%s (%.1f items/s)",
+            total,
+            self._imdb_index_path,
+            total / elapsed if elapsed > 0 else 0.0,
+        )
+        return total
+
+    def _ensure_imdb_index(self, source: IMDbArchiveSource) -> int:
+        self._refresh_imdb_archives_if_due(source)
+        fingerprint, ratings_path, basics_path = self._build_imdb_fingerprint(source)
+        existing_fingerprint = self.db.get_state(self._imdb_fingerprint_key)
+        existing_total = max(0, self.db.get_state_int(self._imdb_total_key, 0))
+        if (
+            existing_fingerprint == fingerprint
+            and self._imdb_index_path.exists()
+            and existing_total >= 0
+        ):
+            return existing_total
+        return self._rebuild_imdb_index(
+            source=source,
+            ratings_path=ratings_path,
+            basics_path=basics_path,
+            fingerprint=fingerprint,
+        )
+
+    def _read_imdb_index_batch(
+        self,
+        source: IMDbArchiveSource,
+    ) -> Tuple[List[IMDbArchiveCandidate], int, int, bool]:
+        if self.db.get_state_int(self._imdb_exhausted_key, 0) == 1:
+            current_line = max(0, self.db.get_state_int(self._imdb_cursor_line_key, 0))
+            current_byte = max(0, self.db.get_state_int(self._imdb_cursor_byte_key, 0))
+            return [], current_line, current_byte, True
+        if not self._imdb_index_path.exists():
+            current_line = max(0, self.db.get_state_int(self._imdb_cursor_line_key, 0))
+            current_byte = max(0, self.db.get_state_int(self._imdb_cursor_byte_key, 0))
+            return [], current_line, current_byte, True
+
+        max_items = max(1, int(source.max_titles_per_cycle))
+        cursor_line = max(0, self.db.get_state_int(self._imdb_cursor_line_key, 0))
+        cursor_byte = max(0, self.db.get_state_int(self._imdb_cursor_byte_key, 0))
+        total_lines = max(0, self.db.get_state_int(self._imdb_total_key, 0))
+
+        batch: List[IMDbArchiveCandidate] = []
+        lines_read = 0
+        eof_reached = False
+        file_size = self._imdb_index_path.stat().st_size
+        if cursor_byte > file_size:
+            cursor_byte = 0
+            cursor_line = 0
+
+        with self._imdb_index_path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(cursor_byte)
+            while len(batch) < max_items:
+                line = handle.readline()
+                if not line:
+                    eof_reached = True
+                    break
+                lines_read += 1
+                stripped = line.rstrip("\n")
+                if not stripped:
+                    continue
+                parts = stripped.split("\t")
+                if len(parts) < 3:
+                    continue
+                imdb_id = str(parts[0]).strip()
+                media_type = str(parts[1]).strip().lower()
+                votes = parse_int(parts[2])
+                if (
+                    not is_valid_imdb_title_id(imdb_id)
+                    or media_type not in {"movie", "tv"}
+                    or votes is None
+                ):
+                    continue
+                average_rating: Optional[float] = None
+                if len(parts) >= 4 and str(parts[3]).strip():
+                    try:
+                        average_rating = float(parts[3])
+                    except (TypeError, ValueError):
+                        average_rating = None
+                batch.append(
+                    IMDbArchiveCandidate(
+                        imdb_id=imdb_id,
+                        media_type=media_type,
+                        num_votes=votes,
+                        average_rating=average_rating,
+                    )
+                )
+            next_byte = handle.tell()
+
+        new_cursor_line = cursor_line + lines_read
+        exhausted = eof_reached or (total_lines > 0 and new_cursor_line >= total_lines)
+        return batch, new_cursor_line, next_byte, exhausted
+
+    @staticmethod
+    def _extract_tmdb_from_find_payload(
+        payload: Dict[str, Any],
+        media_type: str,
+    ) -> Tuple[Optional[int], str, float]:
+        result_key = "movie_results" if media_type == "movie" else "tv_results"
+        result_items = payload.get(result_key)
+        if not isinstance(result_items, list):
+            return None, "", 0.0
+        first_item = result_items[0] if result_items else None
+        if not isinstance(first_item, dict):
+            return None, "", 0.0
+        tmdb_id = parse_int(first_item.get("id"))
+        if tmdb_id is None:
+            return None, "", 0.0
+        if media_type == "movie":
+            title = str(first_item.get("title") or "").strip()
+        else:
+            title = str(first_item.get("name") or "").strip()
+        popularity = 0.0
+        try:
+            popularity = float(first_item.get("popularity") or 0.0)
+        except (TypeError, ValueError):
+            popularity = 0.0
+        return tmdb_id, title, popularity
+
+    async def _map_imdb_candidates_to_tmdb(
+        self,
+        *,
+        candidates: Sequence[IMDbArchiveCandidate],
+        stop_event: asyncio.Event,
+    ) -> Tuple[List[Candidate], int, int]:
+        if not candidates:
+            return [], 0, 0
+
+        mapped: List[Candidate] = []
+        lookup_errors = 0
+        missing_mappings = 0
+        completed = 0
+        mapped_count = 0
+        progress_every = max(50, min(1000, len(candidates) // 20 if len(candidates) > 0 else 50))
+        lock = asyncio.Lock()
+        queue: asyncio.Queue[IMDbArchiveCandidate] = asyncio.Queue()
+        for candidate in candidates:
+            queue.put_nowait(candidate)
+
+        if self.status is not None:
+            self.status.begin_imdb_mapping(total=len(candidates))
+
+        async def worker() -> None:
+            nonlocal lookup_errors
+            nonlocal missing_mappings
+            nonlocal completed
+            nonlocal mapped_count
+            while True:
+                if stop_event.is_set():
+                    return
+                try:
+                    item = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    response = await self.tmdb_client.fetch_find_by_imdb(item.imdb_id)
+                    if not response.ok or not isinstance(response.data, dict):
+                        async with lock:
+                            lookup_errors += 1
+                            completed += 1
+                            if self.status is not None and (
+                                completed == 1
+                                or completed == len(candidates)
+                                or completed % progress_every == 0
+                            ):
+                                self.status.update_imdb_mapping(
+                                    done=completed,
+                                    ok=mapped_count,
+                                    missing=missing_mappings,
+                                    errors=lookup_errors,
+                                )
+                        continue
+                    tmdb_id, title, popularity = self._extract_tmdb_from_find_payload(
+                        response.data,
+                        item.media_type,
+                    )
+                    if tmdb_id is None:
+                        async with lock:
+                            missing_mappings += 1
+                            completed += 1
+                            if self.status is not None and (
+                                completed == 1
+                                or completed == len(candidates)
+                                or completed % progress_every == 0
+                            ):
+                                self.status.update_imdb_mapping(
+                                    done=completed,
+                                    ok=mapped_count,
+                                    missing=missing_mappings,
+                                    errors=lookup_errors,
+                                )
+                        continue
+                    async with lock:
+                        mapped.append(
+                            Candidate(
+                                tmdb_id=tmdb_id,
+                                media_type=item.media_type,
+                                title=title or f"TMDB-{tmdb_id}",
+                                popularity=popularity,
+                            )
+                        )
+                        mapped_count += 1
+                        completed += 1
+                        if self.status is not None and (
+                            completed == 1
+                            or completed == len(candidates)
+                            or completed % progress_every == 0
+                        ):
+                            self.status.update_imdb_mapping(
+                                done=completed,
+                                ok=mapped_count,
+                                missing=missing_mappings,
+                                errors=lookup_errors,
+                            )
+                finally:
+                    queue.task_done()
+
+        worker_count = max(
+            1,
+            min(self.details_concurrency, len(candidates)),
+        )
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        await asyncio.gather(*workers)
+        if self.status is not None:
+            self.status.update_imdb_mapping(
+                done=completed,
+                ok=mapped_count,
+                missing=missing_mappings,
+                errors=lookup_errors,
+            )
+        return mapped, lookup_errors, missing_mappings
 
     @staticmethod
     def _serialize_candidate(candidate: Candidate) -> Dict[str, Any]:
@@ -4471,7 +5256,9 @@ class Harvester:
 
         now_ts = now_epoch()
         cycle_started_ts = now_ts
-        configured_target_pages = sum(source.max_pages for source in self.sources)
+        configured_target_pages = sum(source.max_pages for source in self.tmdb_sources)
+        if self.imdb_archive_source is not None:
+            configured_target_pages += self.imdb_archive_source.max_pages
         effective_target_pages = configured_target_pages
         pages_scanned = 0
         raw_seen_total = 0
@@ -4491,14 +5278,14 @@ class Harvester:
                 "first_page": 0,
                 "last_page": 0,
             }
-            for source in self.sources
+            for source in self.scan_sources
         }
 
         if self.status is not None:
-            self.status.begin_cycle(sources=self.sources)
+            self.status.begin_cycle(sources=self.scan_sources)
 
         def publish_scan_progress(
-            current_source: TMDBSource,
+            current_source: Any,
             *,
             current_page: int,
         ) -> None:
@@ -4516,7 +5303,7 @@ class Harvester:
                 source_stats=source_stats,
             )
 
-        for source in self.sources:
+        for source in self.tmdb_sources:
             if stop_event.is_set():
                 interrupted = True
                 break
@@ -4640,6 +5427,114 @@ class Harvester:
             if interrupted:
                 break
 
+        if not interrupted and self.imdb_archive_source is not None:
+            source = self.imdb_archive_source
+            stat = source_stats[source.name]
+            pages_scanned += 1
+            cursor_line_before = max(0, self.db.get_state_int(self._imdb_cursor_line_key, 0))
+            total_indexed_hint = max(0, self.db.get_state_int(self._imdb_total_key, 0))
+            total_batches_hint = (
+                max(1, math.ceil(total_indexed_hint / source.max_titles_per_cycle))
+                if total_indexed_hint > 0
+                else 1
+            )
+            completed_batches_hint = (
+                min(
+                    total_batches_hint,
+                    math.ceil(cursor_line_before / source.max_titles_per_cycle),
+                )
+                if total_indexed_hint > 0
+                else 0
+            )
+            stat["pages_discovered"] = total_batches_hint
+            stat["pages_effective"] = total_batches_hint
+            stat["pages_fetched"] = completed_batches_hint
+            stat["first_page"] = 1
+            stat["last_page"] = 1
+            publish_scan_progress(source, current_page=1)
+            try:
+                total_indexed = self._ensure_imdb_index(source)
+                total_batches = (
+                    max(1, math.ceil(total_indexed / source.max_titles_per_cycle))
+                    if total_indexed > 0
+                    else 1
+                )
+                stat["pages_discovered"] = total_batches
+                stat["pages_effective"] = total_batches
+                if total_indexed == 0:
+                    publish_scan_progress(source, current_page=1)
+                (
+                    imdb_batch,
+                    next_cursor_line,
+                    next_cursor_byte,
+                    batch_exhausted,
+                ) = self._read_imdb_index_batch(source)
+                stat["raw_seen"] += len(imdb_batch)
+                raw_seen_total += len(imdb_batch)
+                if total_indexed > 0 and imdb_batch:
+                    current_batch = min(
+                        total_batches,
+                        (cursor_line_before // source.max_titles_per_cycle) + 1,
+                    )
+                    stat["pages_fetched"] = max(int(stat["pages_fetched"]), current_batch)
+                publish_scan_progress(source, current_page=1)
+                if imdb_batch and not stop_event.is_set():
+                    LOGGER.info(
+                        "[IMDbArchive] Mapping %s IMDb candidate(s) to TMDB IDs.",
+                        len(imdb_batch),
+                    )
+                    mapped_candidates, lookup_errors, missing_mappings = (
+                        await self._map_imdb_candidates_to_tmdb(
+                            candidates=imdb_batch,
+                            stop_event=stop_event,
+                        )
+                    )
+                    stat["errors"] += lookup_errors
+                    stat["skipped"] += missing_mappings
+                    for candidate in mapped_candidates:
+                        key = (candidate.media_type, candidate.tmdb_id)
+                        if key in seen:
+                            stat["duplicates"] += 1
+                            continue
+                        seen.add(key)
+                        should_harvest = self.db.should_harvest(
+                            tmdb_id=candidate.tmdb_id,
+                            media_type=candidate.media_type,
+                            now_ts=now_ts,
+                            ratings_ttl_seconds=self.ratings_ttl_seconds,
+                            harvest_mode=self.harvest_mode,
+                        )
+                        if not should_harvest:
+                            stat["skipped"] += 1
+                            continue
+                        candidates.append(candidate)
+                        stat["added"] += 1
+                    LOGGER.info(
+                        "[IMDbArchive] TMDB mapping complete: mapped=%s missing=%s errors=%s.",
+                        len(mapped_candidates),
+                        missing_mappings,
+                        lookup_errors,
+                    )
+                if not stop_event.is_set():
+                    self._commit_imdb_cursor(
+                        cursor_line=next_cursor_line,
+                        cursor_byte=next_cursor_byte,
+                        exhausted=batch_exhausted,
+                    )
+                    if total_indexed > 0:
+                        completed_batches = min(
+                            total_batches,
+                            math.ceil(next_cursor_line / source.max_titles_per_cycle),
+                        )
+                        stat["pages_fetched"] = max(int(stat["pages_fetched"]), completed_batches)
+                publish_scan_progress(source, current_page=1)
+                if stop_event.is_set():
+                    interrupted = True
+            except Exception as exc:
+                stat["errors"] += 1
+                LOGGER.warning("[IMDbArchive] candidate scan failed: %s", exc)
+                publish_scan_progress(source, current_page=1)
+
         cycle_finished_ts = now_epoch()
         cycle_metrics = {
             "started_at": cycle_started_ts,
@@ -4651,7 +5546,7 @@ class Harvester:
             "raw_seen": raw_seen_total,
             "harvest_mode": self.harvest_mode,
             "interrupted": interrupted,
-            "source_order": [source.name for source in self.sources],
+            "source_order": [source.name for source in self.scan_sources],
             "sources": source_stats,
         }
         self.db.set_state("tmdb_cycle_metrics", json.dumps(cycle_metrics))
@@ -4669,7 +5564,7 @@ class Harvester:
             (len(candidates) / raw_seen_total) * 100.0 if raw_seen_total > 0 else 0.0
         )
         LOGGER.debug(
-            "[Harvester] Selected %s candidates from configured TMDB sources (pages=%s/%s raw_seen=%s eligible_rate=%.2f%% mode=%s).",
+            "[Harvester] Selected %s candidates from configured sources (pages=%s/%s raw_seen=%s eligible_rate=%.2f%% mode=%s).",
             len(candidates),
             pages_scanned,
             max(pages_scanned, effective_target_pages),
@@ -4876,7 +5771,7 @@ class Harvester:
                     len(candidates),
                 )
                 if self.status is not None:
-                    self.status.begin_cycle(sources=self.sources)
+                    self.status.begin_cycle(sources=self.scan_sources)
                     resumed_raw_seen = sum(
                         int((s or {}).get("raw_seen") or 0)
                         for s in source_stats.values()
@@ -4897,7 +5792,7 @@ class Harvester:
                 self._clear_checkpoint()
 
         if not resumed_from_checkpoint:
-            LOGGER.debug("[Harvester] Cycle start: collecting TMDB candidates.")
+            LOGGER.debug("[Harvester] Cycle start: collecting source candidates.")
             candidates, source_stats, scan_interrupted = await self._collect_candidates(stop_event)
             tmdb_list_request_errors = sum(
                 int(stat.get("errors") or 0) for stat in source_stats.values()
@@ -4912,7 +5807,7 @@ class Harvester:
                         note="stopped during tmdb scan",
                     )
                 LOGGER.info(
-                    "[Harvester] Stop requested during TMDB scan. Checkpointed %s candidate(s).",
+                    "[Harvester] Stop requested during source scan. Checkpointed %s candidate(s).",
                     len(candidates),
                 )
                 return HarvestCycleResult(
@@ -4924,7 +5819,7 @@ class Harvester:
                 )
 
         LOGGER.info(
-            "[Harvester] Cycle completed: collected %s TMDB candidates.",
+            "[Harvester] Cycle completed: collected %s source candidates.",
             len(candidates),
         )
         if not candidates:
@@ -5414,7 +6309,6 @@ class Submitter:
             media_type=media_type,
             id_type=id_type,
             id_value=id_value,
-            existing_pmdb_item_id=pmdb_item_id,
         )
 
         if result.success:
@@ -5912,7 +6806,7 @@ async def run_app(config: Dict[str, Any], logging_runtime: LoggingRuntime) -> No
         LOGGER.info("Database: %s", db_path)
         LOGGER.info("Log file: %s", logging_runtime.log_file_path)
         LOGGER.info(
-            "Starting loops: run_mode=%s, harvest_mode=%s, ratings_refresh_days=%s, tmdb_sources=%s, submitter_lease=%ss, submitter_max_retry_attempts=%s",
+            "Starting loops: run_mode=%s, harvest_mode=%s, ratings_refresh_days=%s, enabled_sources=%s, submitter_lease=%ss, submitter_max_retry_attempts=%s",
             config["runtime"]["run_mode"],
             config["runtime"]["harvest_mode"],
             config["runtime"]["ratings_refresh_days"],
