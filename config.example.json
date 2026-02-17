@@ -94,6 +94,9 @@
       {
         "name": "imdb_archive",
         "enabled": false,
+        "titles_enabled": true,
+        "episodes_enabled": false,
+        "daily_episodes_title_limit": 1000,
         "min_votes": 1000,
         "types": [
           "movie",

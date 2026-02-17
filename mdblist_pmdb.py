@@ -113,6 +113,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             {
                 "name": "imdb_archive",
                 "enabled": False,
+                "titles_enabled": True,
+                "episodes_enabled": False,
+                "daily_episodes_title_limit": 1000,
                 "min_votes": 1000,
                 "types": ["movie", "tvSeries", "tvMiniSeries", "tvMovie"],
                 "exclude_unknown_year": True,
@@ -300,6 +303,9 @@ CONFIG_TMDB_SOURCE_KEYS: Set[str] = {
 CONFIG_IMDB_SOURCE_KEYS: Set[str] = {
     "name",
     "enabled",
+    "titles_enabled",
+    "episodes_enabled",
+    "daily_episodes_title_limit",
     "min_votes",
     "types",
     "exclude_unknown_year",
@@ -315,6 +321,11 @@ IMDB_ARCHIVE_TOTAL_KEY = "imdb_archive_total_v1"
 IMDB_ARCHIVE_EXHAUSTED_KEY = "imdb_archive_exhausted_v1"
 IMDB_ARCHIVE_LAST_UPDATE_KEY = "imdb_archive_last_update_v1"
 IMDB_ARCHIVE_LAST_UPDATE_ATTEMPT_KEY = "imdb_archive_last_update_attempt_v1"
+IMDB_EPISODE_ARCHIVE_FINGERPRINT_KEY = "imdb_episode_archive_fingerprint_v1"
+IMDB_EPISODE_ARCHIVE_CURSOR_LINE_KEY = "imdb_episode_archive_cursor_line_v1"
+IMDB_EPISODE_ARCHIVE_CURSOR_BYTE_KEY = "imdb_episode_archive_cursor_byte_v1"
+IMDB_EPISODE_ARCHIVE_TOTAL_KEY = "imdb_episode_archive_total_v1"
+IMDB_EPISODE_ARCHIVE_EXHAUSTED_KEY = "imdb_episode_archive_exhausted_v1"
 IMDB_ARCHIVE_RETRY_COOLDOWN_SECONDS = 21600  # 6 hours
 DISCOVERY_DAILY_USED_KEY_PREFIX = "discovery_daily_used_v1:"
 HYBRID_SOURCE_LAST_RUN_KEY = "hybrid_source_last_run_v1"
@@ -322,6 +333,9 @@ LOCAL_CYCLE_METRICS_KEY = "local_cycle_metrics"
 IMDB_ARCHIVE_DATASET_URLS: Dict[str, str] = {
     "title.basics.tsv": "https://datasets.imdbws.com/title.basics.tsv.gz",
     "title.ratings.tsv": "https://datasets.imdbws.com/title.ratings.tsv.gz",
+}
+IMDB_EPISODE_DATASET_URLS: Dict[str, str] = {
+    "title.episode.tsv": "https://datasets.imdbws.com/title.episode.tsv.gz",
 }
 
 
@@ -754,6 +768,11 @@ def load_config(path: Path) -> Dict[str, Any]:
         name = str(source.get("name", "")).strip().lower().lstrip("/")
         if name == IMDB_ARCHIVE_SOURCE_NAME:
             enabled = bool(source.get("enabled", True))
+            titles_enabled = bool(source.get("titles_enabled", True))
+            episodes_enabled = bool(source.get("episodes_enabled", False))
+            daily_episodes_title_limit = max(
+                1, int(source.get("daily_episodes_title_limit", 1000))
+            )
             min_votes = max(0, int(source.get("min_votes", 1000)))
             max_titles_per_cycle = max(1, int(source.get("max_titles_per_cycle", 10000)))
             exclude_unknown_year = bool(source.get("exclude_unknown_year", True))
@@ -784,6 +803,9 @@ def load_config(path: Path) -> Dict[str, Any]:
                 {
                     "name": IMDB_ARCHIVE_SOURCE_NAME,
                     "enabled": enabled,
+                    "titles_enabled": titles_enabled,
+                    "episodes_enabled": episodes_enabled,
+                    "daily_episodes_title_limit": daily_episodes_title_limit,
                     "min_votes": min_votes,
                     "types": normalized_types,
                     "exclude_unknown_year": exclude_unknown_year,
@@ -865,6 +887,9 @@ class TMDBSource:
 @dataclass
 class IMDbArchiveSource:
     name: str
+    titles_enabled: bool
+    episodes_enabled: bool
+    daily_episodes_title_limit: int
     min_votes: int
     types: Tuple[str, ...]
     exclude_unknown_year: bool
@@ -879,6 +904,16 @@ class IMDbArchiveCandidate:
     media_type: str
     num_votes: int
     average_rating: Optional[float]
+
+
+@dataclass
+class IMDbEpisodeArchiveCandidate:
+    parent_imdb_id: str
+    episode_imdb_id: str
+    season: int
+    episode: int
+    score: float
+    votes: int
 
 
 @dataclass
@@ -1093,6 +1128,31 @@ class LocalDatabase:
 
             self.conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS episode_ratings (
+                    tmdb_id INTEGER NOT NULL,
+                    media_type TEXT NOT NULL,
+                    season INTEGER NOT NULL,
+                    episode INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    score REAL NOT NULL,
+                    fetched_at INTEGER NOT NULL,
+                    imdb_parent_id TEXT,
+                    imdb_episode_id TEXT,
+                    votes INTEGER,
+                    pmdb_item_id TEXT,
+                    pmdb_status TEXT NOT NULL DEFAULT 'pending',
+                    pmdb_claimed_at INTEGER,
+                    pmdb_submitted_at INTEGER,
+                    pmdb_attempts INTEGER NOT NULL DEFAULT 0,
+                    pmdb_last_error TEXT,
+                    pmdb_retry_after INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (tmdb_id, media_type, season, episode, label)
+                )
+                """
+            )
+
+            self.conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS mappings (
                     tmdb_id INTEGER NOT NULL,
                     media_type TEXT NOT NULL,
@@ -1137,6 +1197,22 @@ class LocalDatabase:
 
             self.conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS episode_daily_title_days (
+                    day_key TEXT NOT NULL,
+                    imdb_parent_id TEXT NOT NULL,
+                    PRIMARY KEY (day_key, imdb_parent_id)
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_episode_daily_title_days_day
+                ON episode_daily_title_days (day_key)
+                """
+            )
+
+            self.conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS submitted_titles (
                     tmdb_id INTEGER NOT NULL,
                     media_type TEXT NOT NULL,
@@ -1171,6 +1247,18 @@ class LocalDatabase:
             )
             self.conn.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_episode_ratings_pending
+                ON episode_ratings (pmdb_status, pmdb_retry_after)
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_episode_ratings_parent_lookup
+                ON episode_ratings (imdb_parent_id, season, episode)
+                """
+            )
+            self.conn.execute(
+                """
                 CREATE INDEX IF NOT EXISTS idx_mappings_pending
                 ON mappings (pmdb_status, pmdb_retry_after)
                 """
@@ -1199,6 +1287,8 @@ class LocalDatabase:
             self._ensure_column("mappings", "pmdb_item_id", "TEXT")
             self._ensure_column("ratings", "pmdb_claimed_at", "INTEGER")
             self._ensure_column("mappings", "pmdb_claimed_at", "INTEGER")
+            self._ensure_column("episode_ratings", "pmdb_item_id", "TEXT")
+            self._ensure_column("episode_ratings", "pmdb_claimed_at", "INTEGER")
 
     def _ensure_column(self, table_name: str, column_name: str, column_type: str) -> None:
         columns = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
@@ -1240,6 +1330,58 @@ class LocalDatabase:
     def delete_state(self, key: str) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM state WHERE key = ?", (key,))
+
+    def get_episode_daily_title_count(self, day_key: str) -> int:
+        row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM episode_daily_title_days
+            WHERE day_key = ?
+            """,
+            (str(day_key),),
+        ).fetchone()
+        return int((row["c"] if row else 0) or 0)
+
+    def get_episode_daily_titles(self, day_key: str) -> Set[str]:
+        rows = self.conn.execute(
+            """
+            SELECT imdb_parent_id
+            FROM episode_daily_title_days
+            WHERE day_key = ?
+            """,
+            (str(day_key),),
+        ).fetchall()
+        return {
+            str(row["imdb_parent_id"]).strip()
+            for row in rows
+            if str(row["imdb_parent_id"] or "").strip()
+        }
+
+    def add_episode_daily_titles(self, day_key: str, parent_ids: Iterable[str]) -> int:
+        normalized_day = str(day_key or "").strip()
+        if not normalized_day:
+            return 0
+        values = sorted(
+            {
+                str(parent_id or "").strip()
+                for parent_id in parent_ids
+                if str(parent_id or "").strip()
+            }
+        )
+        if not values:
+            return 0
+        inserted = 0
+        with self.conn:
+            for parent_id in values:
+                cur = self.conn.execute(
+                    """
+                    INSERT OR IGNORE INTO episode_daily_title_days(day_key, imdb_parent_id)
+                    VALUES (?, ?)
+                    """,
+                    (normalized_day, parent_id),
+                )
+                inserted += int(cur.rowcount or 0)
+        return inserted
 
     def get_service_state(self, service: str) -> Optional[sqlite3.Row]:
         return self.conn.execute(
@@ -1608,6 +1750,142 @@ class LocalDatabase:
         )
         return False
 
+    def _upsert_episode_rating(
+        self,
+        *,
+        tmdb_id: int,
+        media_type: str,
+        season: int,
+        episode: int,
+        label: str,
+        score: float,
+        fetched_at: int,
+        imdb_parent_id: Optional[str],
+        imdb_episode_id: Optional[str],
+        votes: Optional[int],
+    ) -> bool:
+        existing = self.conn.execute(
+            """
+            SELECT score, pmdb_status, pmdb_item_id
+            FROM episode_ratings
+            WHERE tmdb_id = ?
+              AND media_type = ?
+              AND season = ?
+              AND episode = ?
+              AND label = ?
+            """,
+            (tmdb_id, media_type, season, episode, label),
+        ).fetchone()
+
+        if not existing:
+            self.conn.execute(
+                """
+                INSERT INTO episode_ratings(
+                    tmdb_id,
+                    media_type,
+                    season,
+                    episode,
+                    label,
+                    score,
+                    fetched_at,
+                    imdb_parent_id,
+                    imdb_episode_id,
+                    votes,
+                    pmdb_item_id,
+                    pmdb_status,
+                    pmdb_claimed_at,
+                    pmdb_submitted_at,
+                    pmdb_attempts,
+                    pmdb_last_error,
+                    pmdb_retry_after
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 'pending', NULL, NULL, 0, NULL, 0)
+                """,
+                (
+                    tmdb_id,
+                    media_type,
+                    season,
+                    episode,
+                    label,
+                    score,
+                    fetched_at,
+                    imdb_parent_id,
+                    imdb_episode_id,
+                    votes,
+                ),
+            )
+            return True
+
+        existing_tenths = score_to_tenths(existing["score"])
+        new_tenths = score_to_tenths(score)
+        if existing_tenths is None or new_tenths is None:
+            score_changed = True
+        else:
+            score_changed = existing_tenths != new_tenths
+        previous_status = str(existing["pmdb_status"])
+
+        if score_changed or previous_status in {"failed", "retry"}:
+            self.conn.execute(
+                """
+                UPDATE episode_ratings
+                SET score = ?,
+                    fetched_at = ?,
+                    imdb_parent_id = ?,
+                    imdb_episode_id = ?,
+                    votes = ?,
+                    pmdb_status = 'pending',
+                    pmdb_claimed_at = NULL,
+                    pmdb_submitted_at = NULL,
+                    pmdb_attempts = 0,
+                    pmdb_last_error = NULL,
+                    pmdb_retry_after = 0
+                WHERE tmdb_id = ?
+                  AND media_type = ?
+                  AND season = ?
+                  AND episode = ?
+                  AND label = ?
+                """,
+                (
+                    score,
+                    fetched_at,
+                    imdb_parent_id,
+                    imdb_episode_id,
+                    votes,
+                    tmdb_id,
+                    media_type,
+                    season,
+                    episode,
+                    label,
+                ),
+            )
+            return True
+
+        self.conn.execute(
+            """
+            UPDATE episode_ratings
+            SET fetched_at = ?,
+                imdb_parent_id = ?,
+                imdb_episode_id = ?,
+                votes = ?
+            WHERE tmdb_id = ?
+              AND media_type = ?
+              AND season = ?
+              AND episode = ?
+              AND label = ?
+            """,
+            (
+                fetched_at,
+                imdb_parent_id,
+                imdb_episode_id,
+                votes,
+                tmdb_id,
+                media_type,
+                season,
+                episode,
+                label,
+            ),
+        )
+        return False
+
     def _upsert_mapping(
         self,
         tmdb_id: int,
@@ -1743,6 +2021,55 @@ class LocalDatabase:
                     queued_mappings += 1
         return queued_ratings, queued_mappings
 
+    def save_imdb_episode_ratings(
+        self,
+        *,
+        tmdb_id: int,
+        media_type: str,
+        imdb_parent_id: str,
+        entries: Sequence[IMDbEpisodeArchiveCandidate],
+        now_ts: int,
+        default_label: str = "overall",
+    ) -> int:
+        queued = 0
+        safe_media = str(media_type or "").strip().lower()
+        if parse_int(tmdb_id) is None or safe_media not in {"movie", "tv"}:
+            return 0
+        normalized_parent = normalize_imdb_title_id(imdb_parent_id)
+        if not normalized_parent:
+            return 0
+        safe_label = str(default_label or "overall").strip().lower() or "overall"
+        with self.conn:
+            for entry in entries:
+                safe_season = parse_int(entry.season)
+                safe_episode = parse_int(entry.episode)
+                safe_score = clamp_0_100(entry.score)
+                if (
+                    safe_season is None
+                    or safe_episode is None
+                    or safe_season < 1
+                    or safe_episode < 1
+                    or safe_score is None
+                ):
+                    continue
+                safe_episode_imdb = normalize_imdb_title_id(entry.episode_imdb_id)
+                safe_votes = parse_int(entry.votes)
+                queued_now = self._upsert_episode_rating(
+                    tmdb_id=int(tmdb_id),
+                    media_type=safe_media,
+                    season=int(safe_season),
+                    episode=int(safe_episode),
+                    label=safe_label,
+                    score=float(safe_score),
+                    fetched_at=int(now_ts),
+                    imdb_parent_id=normalized_parent,
+                    imdb_episode_id=safe_episode_imdb,
+                    votes=int(safe_votes or 0),
+                )
+                if queued_now:
+                    queued += 1
+        return queued
+
     def recover_in_flight_rows(self) -> None:
         """Re-queue rows that were claimed before an unclean shutdown."""
         with self.conn:
@@ -1766,6 +2093,16 @@ class LocalDatabase:
                 WHERE pmdb_status = 'in_flight'
                 """
             )
+            self.conn.execute(
+                """
+                UPDATE episode_ratings
+                SET pmdb_status = 'retry',
+                    pmdb_retry_after = 0,
+                    pmdb_claimed_at = NULL,
+                    pmdb_last_error = COALESCE(pmdb_last_error, 'Recovered from in_flight')
+                WHERE pmdb_status = 'in_flight'
+                """
+            )
 
     def recover_stale_in_flight_rows(self, lease_seconds: int) -> Dict[str, int]:
         lease = max(30, int(lease_seconds))
@@ -1774,6 +2111,15 @@ class LocalDatabase:
             """
             SELECT COUNT(*) AS c
             FROM ratings
+            WHERE pmdb_status = 'in_flight'
+              AND COALESCE(pmdb_claimed_at, 0) <= ?
+            """,
+            (cutoff,),
+        ).fetchone()
+        episode_ratings_count_row = self.conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM episode_ratings
             WHERE pmdb_status = 'in_flight'
               AND COALESCE(pmdb_claimed_at, 0) <= ?
             """,
@@ -1803,6 +2149,18 @@ class LocalDatabase:
             )
             self.conn.execute(
                 """
+                UPDATE episode_ratings
+                SET pmdb_status = 'retry',
+                    pmdb_retry_after = 0,
+                    pmdb_claimed_at = NULL,
+                    pmdb_last_error = COALESCE(pmdb_last_error, 'Recovered stale in_flight lease')
+                WHERE pmdb_status = 'in_flight'
+                  AND COALESCE(pmdb_claimed_at, 0) <= ?
+                """,
+                (cutoff,),
+            )
+            self.conn.execute(
+                """
                 UPDATE mappings
                 SET pmdb_status = 'retry',
                     pmdb_retry_after = 0,
@@ -1815,6 +2173,9 @@ class LocalDatabase:
             )
         return {
             "ratings": int(ratings_count_row["c"] if ratings_count_row else 0),
+            "episode_ratings": int(
+                episode_ratings_count_row["c"] if episode_ratings_count_row else 0
+            ),
             "mappings": int(mappings_count_row["c"] if mappings_count_row else 0),
         }
 
@@ -1942,6 +2303,87 @@ class LocalDatabase:
             )
             return row
 
+    def claim_next_pending_episode_ratings_batch(
+        self,
+        *,
+        now_ts: int,
+        batch_size: int = 50,
+    ) -> List[sqlite3.Row]:
+        safe_batch_size = max(1, min(50, int(batch_size)))
+        with self.conn:
+            first_row = self.conn.execute(
+                """
+                SELECT tmdb_id, media_type, season
+                FROM episode_ratings
+                WHERE pmdb_status IN ('pending', 'retry')
+                  AND pmdb_retry_after <= ?
+                ORDER BY fetched_at ASC, rowid ASC
+                LIMIT 1
+                """,
+                (int(now_ts),),
+            ).fetchone()
+            if first_row is None:
+                return []
+
+            tmdb_id = int(first_row["tmdb_id"])
+            media_type = str(first_row["media_type"])
+            season = int(first_row["season"])
+            rows = self.conn.execute(
+                """
+                SELECT
+                    tmdb_id,
+                    media_type,
+                    season,
+                    episode,
+                    label,
+                    score,
+                    pmdb_item_id,
+                    pmdb_attempts
+                FROM episode_ratings
+                WHERE pmdb_status IN ('pending', 'retry')
+                  AND pmdb_retry_after <= ?
+                  AND tmdb_id = ?
+                  AND media_type = ?
+                  AND season = ?
+                ORDER BY episode ASC, fetched_at ASC, rowid ASC
+                LIMIT ?
+                """,
+                (
+                    int(now_ts),
+                    tmdb_id,
+                    media_type,
+                    season,
+                    safe_batch_size,
+                ),
+            ).fetchall()
+            if not rows:
+                return []
+
+            self.conn.executemany(
+                """
+                UPDATE episode_ratings
+                SET pmdb_status = 'in_flight',
+                    pmdb_claimed_at = ?
+                WHERE tmdb_id = ?
+                  AND media_type = ?
+                  AND season = ?
+                  AND episode = ?
+                  AND label = ?
+                """,
+                [
+                    (
+                        int(now_ts),
+                        int(row["tmdb_id"]),
+                        str(row["media_type"]),
+                        int(row["season"]),
+                        int(row["episode"]),
+                        str(row["label"]),
+                    )
+                    for row in rows
+                ],
+            )
+            return rows
+
     def mark_rating_submitted(
         self,
         tmdb_id: int,
@@ -2000,6 +2442,44 @@ class LocalDatabase:
                 submitted_at=submitted_at,
             )
 
+    def mark_episode_rating_submitted(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        season: int,
+        episode: int,
+        label: str,
+        submitted_at: int,
+        pmdb_item_id: Optional[str] = None,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE episode_ratings
+                SET pmdb_status = 'submitted',
+                    pmdb_item_id = COALESCE(?, pmdb_item_id),
+                    pmdb_claimed_at = NULL,
+                    pmdb_submitted_at = ?,
+                    pmdb_last_error = NULL,
+                    pmdb_retry_after = 0
+                WHERE tmdb_id = ?
+                  AND media_type = ?
+                  AND season = ?
+                  AND episode = ?
+                  AND label = ?
+                """,
+                (
+                    pmdb_item_id,
+                    int(submitted_at),
+                    int(tmdb_id),
+                    str(media_type),
+                    int(season),
+                    int(episode),
+                    str(label),
+                ),
+            )
+            self._record_episode_submission_success(submitted_at=submitted_at)
+
     def mark_rating_retry(
         self,
         tmdb_id: int,
@@ -2044,6 +2524,42 @@ class LocalDatabase:
                 (error_text, retry_after, tmdb_id, media_type, id_type),
             )
 
+    def mark_episode_rating_retry(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        season: int,
+        episode: int,
+        label: str,
+        retry_after: int,
+        error_text: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE episode_ratings
+                SET pmdb_status = 'retry',
+                    pmdb_attempts = pmdb_attempts + 1,
+                    pmdb_last_error = ?,
+                    pmdb_claimed_at = NULL,
+                    pmdb_retry_after = ?
+                WHERE tmdb_id = ?
+                  AND media_type = ?
+                  AND season = ?
+                  AND episode = ?
+                  AND label = ?
+                """,
+                (
+                    str(error_text),
+                    int(retry_after),
+                    int(tmdb_id),
+                    str(media_type),
+                    int(season),
+                    int(episode),
+                    str(label),
+                ),
+            )
+
     def mark_rating_failed(
         self,
         tmdb_id: int,
@@ -2084,29 +2600,74 @@ class LocalDatabase:
                 (error_text, tmdb_id, media_type, id_type),
             )
 
+    def mark_episode_rating_failed(
+        self,
+        tmdb_id: int,
+        media_type: str,
+        season: int,
+        episode: int,
+        label: str,
+        error_text: str,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """
+                UPDATE episode_ratings
+                SET pmdb_status = 'failed',
+                    pmdb_attempts = pmdb_attempts + 1,
+                    pmdb_last_error = ?,
+                    pmdb_claimed_at = NULL
+                WHERE tmdb_id = ?
+                  AND media_type = ?
+                  AND season = ?
+                  AND episode = ?
+                  AND label = ?
+                """,
+                (
+                    str(error_text),
+                    int(tmdb_id),
+                    str(media_type),
+                    int(season),
+                    int(episode),
+                    str(label),
+                ),
+            )
+
     def queue_counts(self) -> Dict[str, int]:
         row = self.conn.execute(
             """
             SELECT
                 (SELECT COUNT(*) FROM ratings WHERE pmdb_status IN ('pending', 'retry')) AS ratings_pending,
+                (SELECT COUNT(*) FROM episode_ratings WHERE pmdb_status IN ('pending', 'retry')) AS episode_ratings_pending,
                 (SELECT COUNT(*) FROM mappings WHERE pmdb_status IN ('pending', 'retry')) AS mappings_pending,
                 (SELECT COUNT(*) FROM ratings WHERE pmdb_status = 'in_flight') AS ratings_in_flight,
+                (SELECT COUNT(*) FROM episode_ratings WHERE pmdb_status = 'in_flight') AS episode_ratings_in_flight,
                 (SELECT COUNT(*) FROM mappings WHERE pmdb_status = 'in_flight') AS mappings_in_flight,
                 (SELECT COUNT(*) FROM ratings WHERE pmdb_status = 'failed') AS ratings_failed,
+                (SELECT COUNT(*) FROM episode_ratings WHERE pmdb_status = 'failed') AS episode_ratings_failed,
                 (SELECT COUNT(*) FROM mappings WHERE pmdb_status = 'failed') AS mappings_failed
             """
         ).fetchone()
         return {
             "ratings_pending": int(row["ratings_pending"]),
+            "episode_ratings_pending": int(row["episode_ratings_pending"]),
             "mappings_pending": int(row["mappings_pending"]),
             "ratings_in_flight": int(row["ratings_in_flight"]),
+            "episode_ratings_in_flight": int(row["episode_ratings_in_flight"]),
             "mappings_in_flight": int(row["mappings_in_flight"]),
             "ratings_failed": int(row["ratings_failed"]),
+            "episode_ratings_failed": int(row["episode_ratings_failed"]),
             "mappings_failed": int(row["mappings_failed"]),
         }
 
     def count_due_queue(self, *, kind: str, now_ts: int) -> int:
-        table = "ratings" if str(kind).strip().lower() == "ratings" else "mappings"
+        normalized_kind = str(kind).strip().lower()
+        if normalized_kind in {"ratings", "rating"}:
+            table = "ratings"
+        elif normalized_kind in {"episode_ratings", "episode_rating", "episodes"}:
+            table = "episode_ratings"
+        else:
+            table = "mappings"
         row = self.conn.execute(
             f"""
             SELECT COUNT(*) AS c
@@ -2126,7 +2687,13 @@ class LocalDatabase:
         media_type: str,
         submitted_at: int,
     ) -> None:
-        kind_name = "ratings" if str(kind).strip().lower() == "ratings" else "mappings"
+        normalized_kind = str(kind).strip().lower()
+        if normalized_kind in {"ratings", "rating"}:
+            kind_name = "ratings"
+        elif normalized_kind in {"episode_ratings", "episode_rating", "episodes"}:
+            kind_name = "episode_ratings"
+        else:
+            kind_name = "mappings"
         day = local_day_key(submitted_at)
         total_key = f"metrics:pmdb_submitted:{kind_name}:total"
         day_key = f"metrics:pmdb_submitted:{kind_name}:day:{day}"
@@ -2146,6 +2713,9 @@ class LocalDatabase:
             (day_key,),
         )
 
+        if kind_name == "episode_ratings":
+            return
+
         self.conn.execute(
             """
             INSERT INTO submitted_titles(
@@ -2164,20 +2734,32 @@ class LocalDatabase:
             (day, tmdb_id, media_type),
         )
 
+    def _record_episode_submission_success(self, *, submitted_at: int) -> None:
+        self._record_submission_success(
+            kind="episode_ratings",
+            tmdb_id=0,
+            media_type="tv",
+            submitted_at=submitted_at,
+        )
+
     def dashboard_snapshot(self, day_key: str) -> Dict[str, int]:
         row = self.conn.execute(
             """
             SELECT
                 (SELECT COUNT(*) FROM titles) AS titles_total,
                 (SELECT COUNT(*) FROM ratings) AS ratings_total,
+                (SELECT COUNT(*) FROM episode_ratings) AS episode_ratings_total,
                 (SELECT COUNT(*) FROM mappings) AS mappings_total,
                 (SELECT COUNT(*) FROM submitted_titles) AS titles_submitted_total,
                 (SELECT COUNT(*) FROM submitted_title_days WHERE day_key = ?) AS titles_submitted_today,
                 (SELECT CAST(value AS INTEGER) FROM state WHERE key = ?) AS ratings_submitted_total,
+                (SELECT CAST(value AS INTEGER) FROM state WHERE key = ?) AS episode_ratings_submitted_total,
                 (SELECT CAST(value AS INTEGER) FROM state WHERE key = ?) AS mappings_submitted_total,
                 (SELECT CAST(value AS INTEGER) FROM state WHERE key = ?) AS ratings_submitted_today,
+                (SELECT CAST(value AS INTEGER) FROM state WHERE key = ?) AS episode_ratings_submitted_today,
                 (SELECT CAST(value AS INTEGER) FROM state WHERE key = ?) AS mappings_submitted_today,
                 (SELECT MAX(pmdb_submitted_at) FROM ratings) AS ratings_last_submit_at,
+                (SELECT MAX(pmdb_submitted_at) FROM episode_ratings) AS episode_ratings_last_submit_at,
                 (SELECT MAX(pmdb_submitted_at) FROM mappings) AS mappings_last_submit_at,
                 (SELECT MAX(last_harvested_at) FROM titles) AS titles_last_harvested_at,
                 (SELECT MAX(last_mdblist_fetch_at) FROM titles) AS titles_last_mdblist_fetch_at
@@ -2185,22 +2767,34 @@ class LocalDatabase:
             (
                 day_key,
                 "metrics:pmdb_submitted:ratings:total",
+                "metrics:pmdb_submitted:episode_ratings:total",
                 "metrics:pmdb_submitted:mappings:total",
                 f"metrics:pmdb_submitted:ratings:day:{day_key}",
+                f"metrics:pmdb_submitted:episode_ratings:day:{day_key}",
                 f"metrics:pmdb_submitted:mappings:day:{day_key}",
             ),
         ).fetchone()
         return {
             "titles_total": int(row["titles_total"] or 0),
             "ratings_total": int(row["ratings_total"] or 0),
+            "episode_ratings_total": int(row["episode_ratings_total"] or 0),
             "mappings_total": int(row["mappings_total"] or 0),
             "titles_submitted_total": int(row["titles_submitted_total"] or 0),
             "titles_submitted_today": int(row["titles_submitted_today"] or 0),
             "ratings_submitted_total": int(row["ratings_submitted_total"] or 0),
+            "episode_ratings_submitted_total": int(
+                row["episode_ratings_submitted_total"] or 0
+            ),
             "mappings_submitted_total": int(row["mappings_submitted_total"] or 0),
             "ratings_submitted_today": int(row["ratings_submitted_today"] or 0),
+            "episode_ratings_submitted_today": int(
+                row["episode_ratings_submitted_today"] or 0
+            ),
             "mappings_submitted_today": int(row["mappings_submitted_today"] or 0),
             "ratings_last_submit_at": int(row["ratings_last_submit_at"] or 0),
+            "episode_ratings_last_submit_at": int(
+                row["episode_ratings_last_submit_at"] or 0
+            ),
             "mappings_last_submit_at": int(row["mappings_last_submit_at"] or 0),
             "titles_last_harvested_at": int(row["titles_last_harvested_at"] or 0),
             "titles_last_mdblist_fetch_at": int(row["titles_last_mdblist_fetch_at"] or 0),
@@ -3575,6 +4169,30 @@ class PMDBClient:
             gate=self.api_gate,
         )
 
+    async def _fetch_existing_episode_ratings(
+        self,
+        *,
+        tmdb_id: int,
+        media_type: str,
+        season: int,
+        episode: int,
+        label: str,
+    ) -> APIResponse:
+        return await self.http.request_json(
+            method="GET",
+            url=f"{self.base_url}/api/external/episode-ratings",
+            headers=self._auth_headers(),
+            params={
+                "tmdb_id": tmdb_id,
+                "media_type": media_type,
+                "season": season,
+                "episode": episode,
+                "label": label,
+                "perPage": 500,
+            },
+            gate=self.api_gate,
+        )
+
     async def _fetch_existing_mappings(
         self, tmdb_id: int, media_type: str
     ) -> APIResponse:
@@ -3661,6 +4279,35 @@ class PMDBClient:
                 return True, self._extract_entry_id(entry)
         return False, None
 
+    async def confirm_episode_rating_exists(
+        self,
+        *,
+        tmdb_id: int,
+        media_type: str,
+        season: int,
+        episode: int,
+        label: str,
+        score: float,
+    ) -> Tuple[bool, Optional[str]]:
+        lookup = await self._fetch_existing_episode_ratings(
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            season=season,
+            episode=episode,
+            label=label,
+        )
+        if lookup.status != 200 or not isinstance(lookup.data, dict):
+            return False, None
+        entries = lookup.data.get("items")
+        if not isinstance(entries, list):
+            return False, None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if self._rating_entry_matches_score(entry, score):
+                return True, self._extract_entry_id(entry)
+        return False, None
+
     async def confirm_mapping_exists(
         self,
         *,
@@ -3686,6 +4333,16 @@ class PMDBClient:
         return self._to_delete_result(
             response,
             endpoint=f"/api/external/ratings/{rating_id}",
+        )
+
+    async def _delete_episode_rating_by_id(self, rating_id: str) -> PMDBDeleteResult:
+        response = await self._delete_with_gates(
+            url=f"{self.base_url}/api/external/episode-ratings/{rating_id}",
+            contribution_gate=self.rating_gate,
+        )
+        return self._to_delete_result(
+            response,
+            endpoint=f"/api/external/episode-ratings/{rating_id}",
         )
 
     async def _delete_mapping_by_id(self, mapping_id: str) -> PMDBDeleteResult:
@@ -3999,6 +4656,30 @@ class PMDBClient:
             return resolved
         return result
 
+    async def submit_episode_ratings_batch(
+        self,
+        *,
+        tmdb_id: int,
+        media_type: str,
+        season: int,
+        label: str,
+        ratings: Sequence[Dict[str, Any]],
+    ) -> APIResponse:
+        return await self._post_with_gates(
+            url=f"{self.base_url}/api/external/episode-ratings/batch",
+            payload={
+                "tmdb_id": int(tmdb_id),
+                "media_type": str(media_type),
+                "season": int(season),
+                "label": str(label),
+                "ratings": list(ratings),
+            },
+            contribution_gate=self.rating_gate,
+        )
+
+    async def delete_episode_rating_by_id(self, rating_id: str) -> PMDBDeleteResult:
+        return await self._delete_episode_rating_by_id(rating_id)
+
 
 class RuntimeDashboard:
     """In-process terminal dashboard rendered with rich."""
@@ -4091,13 +4772,29 @@ class RuntimeDashboard:
         self.enriched_queue_ratings = 0
         self.enriched_queue_mappings = 0
 
+        self.episodes_enabled = False
+        self.episode_daily_title_limit = 0
+        self.episode_daily_titles_used = 0
+        self.episode_daily_titles_remaining = 0
+        self.episode_cycle_rows_selected = 0
+        self.episode_cycle_titles_selected = 0
+        self.episode_cycle_titles_mapped = 0
+        self.episode_cycle_titles_missing = 0
+        self.episode_cycle_lookup_errors = 0
+        self.episode_cycle_rows_queued = 0
+        self.episode_cycle_queue_total = 0
+        self.episode_cycle_exhausted = 0
+        self.episode_cycle_daily_capped = 0
+
         # Submitter runtime
         self.submit_events_ratings: deque[int] = deque()
+        self.submit_events_episode_ratings: deque[int] = deque()
         self.submit_events_mappings: deque[int] = deque()
         self.last_submit_error = ""
         self.last_submit_error_at = 0
 
         self._ratings_queue_peak = 0
+        self._episode_ratings_queue_peak = 0
         self._mappings_queue_peak = 0
 
         # DB-backed snapshots refreshed periodically.
@@ -4105,23 +4802,30 @@ class RuntimeDashboard:
         self._db_refresh_interval = 2.0
         self.queue_snapshot: Dict[str, int] = {
             "ratings_pending": 0,
+            "episode_ratings_pending": 0,
             "mappings_pending": 0,
             "ratings_in_flight": 0,
+            "episode_ratings_in_flight": 0,
             "mappings_in_flight": 0,
             "ratings_failed": 0,
+            "episode_ratings_failed": 0,
             "mappings_failed": 0,
         }
         self.db_totals_snapshot: Dict[str, int] = {
             "titles_total": 0,
             "ratings_total": 0,
+            "episode_ratings_total": 0,
             "mappings_total": 0,
             "titles_submitted_total": 0,
             "titles_submitted_today": 0,
             "ratings_submitted_total": 0,
+            "episode_ratings_submitted_total": 0,
             "mappings_submitted_total": 0,
             "ratings_submitted_today": 0,
+            "episode_ratings_submitted_today": 0,
             "mappings_submitted_today": 0,
             "ratings_last_submit_at": 0,
+            "episode_ratings_last_submit_at": 0,
             "mappings_last_submit_at": 0,
             "titles_last_harvested_at": 0,
             "titles_last_mdblist_fetch_at": 0,
@@ -4157,6 +4861,35 @@ class RuntimeDashboard:
         self.local_budget_remaining = max(0, int(stats.get("budget_remaining") or 0))
         self.local_budget_capped = 1 if int(stats.get("budget_capped") or 0) > 0 else 0
 
+    def set_episode_mode(
+        self,
+        *,
+        enabled: bool,
+        daily_title_limit: int,
+    ) -> None:
+        self.episodes_enabled = bool(enabled)
+        self.episode_daily_title_limit = max(0, int(daily_title_limit))
+        if not self.episodes_enabled:
+            self.episode_daily_titles_used = 0
+            self.episode_daily_titles_remaining = 0
+
+    def update_episode_cycle_stats(self, stats: Optional[Dict[str, int]]) -> None:
+        if not isinstance(stats, dict):
+            return
+        self.episode_daily_titles_used = max(0, int(stats.get("daily_titles_used") or 0))
+        self.episode_daily_titles_remaining = max(
+            0, int(stats.get("daily_titles_remaining") or 0)
+        )
+        self.episode_cycle_rows_selected = max(0, int(stats.get("rows_selected") or 0))
+        self.episode_cycle_titles_selected = max(0, int(stats.get("titles_selected") or 0))
+        self.episode_cycle_titles_mapped = max(0, int(stats.get("titles_mapped") or 0))
+        self.episode_cycle_titles_missing = max(0, int(stats.get("titles_missing") or 0))
+        self.episode_cycle_lookup_errors = max(0, int(stats.get("lookup_errors") or 0))
+        self.episode_cycle_rows_queued = max(0, int(stats.get("rows_queued") or 0))
+        self.episode_cycle_queue_total = max(0, int(stats.get("queue_total") or 0))
+        self.episode_cycle_exhausted = 1 if int(stats.get("exhausted") or 0) > 0 else 0
+        self.episode_cycle_daily_capped = 1 if int(stats.get("daily_capped") or 0) > 0 else 0
+
     def update_scan_cap_reached(self, capped: bool) -> None:
         self.scan_cap_reached = bool(capped)
 
@@ -4165,6 +4898,7 @@ class RuntimeDashboard:
         self.phase = "Candidate scan"
         self.cycle_started_at = now_epoch()
         self._ratings_queue_peak = 0
+        self._episode_ratings_queue_peak = 0
         self._mappings_queue_peak = 0
 
         self.scan_pages_done = 0
@@ -4227,6 +4961,16 @@ class RuntimeDashboard:
         self.enriched_tmdb_only = 0
         self.enriched_queue_ratings = 0
         self.enriched_queue_mappings = 0
+
+        self.episode_cycle_rows_selected = 0
+        self.episode_cycle_titles_selected = 0
+        self.episode_cycle_titles_mapped = 0
+        self.episode_cycle_titles_missing = 0
+        self.episode_cycle_lookup_errors = 0
+        self.episode_cycle_rows_queued = 0
+        self.episode_cycle_queue_total = 0
+        self.episode_cycle_exhausted = 0
+        self.episode_cycle_daily_capped = 0
 
     def update_scan_progress(
         self,
@@ -4449,6 +5193,8 @@ class RuntimeDashboard:
         if outcome == "success":
             if kind == "rating":
                 self.submit_events_ratings.append(now_ts)
+            elif kind in {"episode_rating", "episode_ratings"}:
+                self.submit_events_episode_ratings.append(now_ts)
             else:
                 self.submit_events_mappings.append(now_ts)
             return
@@ -4498,6 +5244,11 @@ class RuntimeDashboard:
         cutoff = now_ts - 3600
         while self.submit_events_ratings and self.submit_events_ratings[0] < cutoff:
             self.submit_events_ratings.popleft()
+        while (
+            self.submit_events_episode_ratings
+            and self.submit_events_episode_ratings[0] < cutoff
+        ):
+            self.submit_events_episode_ratings.popleft()
         while self.submit_events_mappings and self.submit_events_mappings[0] < cutoff:
             self.submit_events_mappings.popleft()
 
@@ -4523,6 +5274,10 @@ class RuntimeDashboard:
             self.queue_snapshot["ratings_pending"]
             + self.queue_snapshot["ratings_in_flight"]
         )
+        episode_ratings_remaining = (
+            self.queue_snapshot["episode_ratings_pending"]
+            + self.queue_snapshot["episode_ratings_in_flight"]
+        )
         mappings_remaining = (
             self.queue_snapshot["mappings_pending"]
             + self.queue_snapshot["mappings_in_flight"]
@@ -4531,6 +5286,10 @@ class RuntimeDashboard:
             self._ratings_queue_peak = 0
         elif ratings_remaining > self._ratings_queue_peak:
             self._ratings_queue_peak = ratings_remaining
+        if episode_ratings_remaining <= 0:
+            self._episode_ratings_queue_peak = 0
+        elif episode_ratings_remaining > self._episode_ratings_queue_peak:
+            self._episode_ratings_queue_peak = episode_ratings_remaining
         if mappings_remaining <= 0:
             self._mappings_queue_peak = 0
         elif mappings_remaining > self._mappings_queue_peak:
@@ -4710,6 +5469,28 @@ class RuntimeDashboard:
                 f"q(r={int(self.enriched_queue_ratings)},m={int(self.enriched_queue_mappings)})"
             ),
         )
+        if self.episodes_enabled:
+            episode_daily_bar = self._render_bar(
+                max(1, int(self.episode_daily_title_limit)),
+                int(self.episode_daily_titles_used),
+            )
+            table.add_row(
+                "IMDb episodes",
+                episode_daily_bar,
+                (
+                    f"titles={int(self.episode_daily_titles_used)}/{int(self.episode_daily_title_limit)} "
+                    f"remain={int(self.episode_daily_titles_remaining)} "
+                    f"sel={int(self.episode_cycle_titles_selected)} "
+                    f"map={int(self.episode_cycle_titles_mapped)} "
+                    f"miss={int(self.episode_cycle_titles_missing)} "
+                    f"err={int(self.episode_cycle_lookup_errors)} "
+                    f"rows={int(self.episode_cycle_rows_selected)} "
+                    f"queued={int(self.episode_cycle_rows_queued)} "
+                    f"q={int(self.episode_cycle_queue_total)} "
+                    f"exh={int(self.episode_cycle_exhausted)} "
+                    f"cap={int(self.episode_cycle_daily_capped)}"
+                ),
+            )
 
         subtitle = (
             f"mode={self.discovery_mode} phase={self.phase} cycle={self.cycle_index} "
@@ -4781,6 +5562,28 @@ class RuntimeDashboard:
                 f"capped={int(self.local_budget_capped)}"
             ),
         )
+        if self.episodes_enabled:
+            episode_daily_bar = self._render_bar(
+                max(1, int(self.episode_daily_title_limit)),
+                int(self.episode_daily_titles_used),
+            )
+            table.add_row(
+                "Episodes budget",
+                episode_daily_bar,
+                (
+                    f"titles={int(self.episode_daily_titles_used)}/{int(self.episode_daily_title_limit)} "
+                    f"remain={int(self.episode_daily_titles_remaining)} "
+                    f"sel={int(self.episode_cycle_titles_selected)} "
+                    f"map={int(self.episode_cycle_titles_mapped)} "
+                    f"miss={int(self.episode_cycle_titles_missing)} "
+                    f"err={int(self.episode_cycle_lookup_errors)} "
+                    f"rows={int(self.episode_cycle_rows_selected)} "
+                    f"queued={int(self.episode_cycle_rows_queued)} "
+                    f"q={int(self.episode_cycle_queue_total)} "
+                    f"exh={int(self.episode_cycle_exhausted)} "
+                    f"cap={int(self.episode_cycle_daily_capped)}"
+                ),
+            )
 
         if self.discovery_mode == "local":
             details_success_pct = (
@@ -4867,26 +5670,50 @@ class RuntimeDashboard:
         ratings_in_flight = self.queue_snapshot["ratings_in_flight"]
         ratings_failed = self.queue_snapshot["ratings_failed"]
 
+        episode_ratings_pending = self.queue_snapshot["episode_ratings_pending"]
+        episode_ratings_in_flight = self.queue_snapshot["episode_ratings_in_flight"]
+        episode_ratings_failed = self.queue_snapshot["episode_ratings_failed"]
+
         mappings_pending = self.queue_snapshot["mappings_pending"]
         mappings_in_flight = self.queue_snapshot["mappings_in_flight"]
         mappings_failed = self.queue_snapshot["mappings_failed"]
 
         ratings_remaining = ratings_pending + ratings_in_flight
+        episode_ratings_remaining = episode_ratings_pending + episode_ratings_in_flight
         mappings_remaining = mappings_pending + mappings_in_flight
 
+        show_episode_queue = (
+            self.episodes_enabled
+            or episode_ratings_pending > 0
+            or episode_ratings_in_flight > 0
+            or episode_ratings_failed > 0
+            or int(self.db_totals_snapshot["episode_ratings_submitted_total"]) > 0
+        )
+
         ratings_peak = max(1, self._ratings_queue_peak)
+        episode_ratings_peak = max(1, self._episode_ratings_queue_peak)
         mappings_peak = max(1, self._mappings_queue_peak)
 
         # Queue bars are intentionally remaining-based (decreasing as queue drains).
         ratings_bar: Any = self._render_bar(ratings_peak, max(0, int(ratings_remaining)))
+        episode_ratings_bar: Any = self._render_bar(
+            episode_ratings_peak,
+            max(0, int(episode_ratings_remaining)),
+        )
         mappings_bar: Any = self._render_bar(mappings_peak, max(0, int(mappings_remaining)))
 
         ratings_due = self.db.count_due_queue(kind="ratings", now_ts=now_ts)
+        episode_ratings_due = self.db.count_due_queue(kind="episode_ratings", now_ts=now_ts)
         mappings_due = self.db.count_due_queue(kind="mappings", now_ts=now_ts)
         ratings_wait = max(0, ratings_pending - ratings_due)
+        episode_ratings_wait = max(0, episode_ratings_pending - episode_ratings_due)
         mappings_wait = max(0, mappings_pending - mappings_due)
 
-        workers_busy = min(self.submitter_workers, ratings_in_flight + mappings_in_flight)
+        effective_episode_in_flight = episode_ratings_in_flight if show_episode_queue else 0
+        workers_busy = min(
+            self.submitter_workers,
+            ratings_in_flight + effective_episode_in_flight + mappings_in_flight,
+        )
         worker_util = (
             (workers_busy / self.submitter_workers) * 100.0
             if self.submitter_workers > 0
@@ -4894,8 +5721,15 @@ class RuntimeDashboard:
         )
         self._trim_submit_events(now_ts)
         ratings_ok_60 = self._count_recent(self.submit_events_ratings, 60, now_ts)
+        episode_ratings_ok_60 = self._count_recent(
+            self.submit_events_episode_ratings,
+            60,
+            now_ts,
+        )
         mappings_ok_60 = self._count_recent(self.submit_events_mappings, 60, now_ts)
         total_ok_60 = ratings_ok_60 + mappings_ok_60
+        if show_episode_queue:
+            total_ok_60 += episode_ratings_ok_60
 
         table = Table.grid(expand=True, padding=(0, 0))
         table.add_column(
@@ -4934,6 +5768,19 @@ class RuntimeDashboard:
                 f"s={int(self.db_totals_snapshot['ratings_submitted_total'])}"
             ),
         )
+        if show_episode_queue:
+            table.add_row(
+                "Ep ratings queue",
+                episode_ratings_bar,
+                (
+                    f"q={int(episode_ratings_pending)} "
+                    f"d={int(episode_ratings_due)} "
+                    f"w={int(episode_ratings_wait)} "
+                    f"a={int(episode_ratings_in_flight)} "
+                    f"f={int(episode_ratings_failed)} "
+                    f"s={int(self.db_totals_snapshot['episode_ratings_submitted_total'])}"
+                ),
+            )
         table.add_row(
             "Mappings queue",
             mappings_bar,
@@ -4951,17 +5798,33 @@ class RuntimeDashboard:
             "Workers",
             workers_bar,
             (
-                f"{int(workers_busy)}/{int(self.submitter_workers)} "
-                f"(r={int(ratings_in_flight)},m={int(mappings_in_flight)}) "
-                f"util={worker_util:.1f}%"
+                (
+                    f"{int(workers_busy)}/{int(self.submitter_workers)} "
+                    f"(r={int(ratings_in_flight)},e={int(episode_ratings_in_flight)},m={int(mappings_in_flight)}) "
+                    f"util={worker_util:.1f}%"
+                )
+                if show_episode_queue
+                else (
+                    f"{int(workers_busy)}/{int(self.submitter_workers)} "
+                    f"(r={int(ratings_in_flight)},m={int(mappings_in_flight)}) "
+                    f"util={worker_util:.1f}%"
+                )
             ),
         )
         return Panel(
             table,
             title="Submitter",
             subtitle=(
-                f"ok60: r={int(ratings_ok_60)} "
-                f"m={int(mappings_ok_60)} total={int(total_ok_60)}"
+                (
+                    f"ok60: r={int(ratings_ok_60)} "
+                    f"e={int(episode_ratings_ok_60)} "
+                    f"m={int(mappings_ok_60)} total={int(total_ok_60)}"
+                )
+                if show_episode_queue
+                else (
+                    f"ok60: r={int(ratings_ok_60)} "
+                    f"m={int(mappings_ok_60)} total={int(total_ok_60)}"
+                )
             ),
             border_style="green",
             title_align="left",
@@ -5032,6 +5895,17 @@ class RuntimeDashboard:
                 )
             )
 
+        show_episode_metrics = (
+            self.episodes_enabled
+            or int(self.db_totals_snapshot["episode_ratings_total"]) > 0
+            or int(self.db_totals_snapshot["episode_ratings_submitted_total"]) > 0
+            or int(self.db_totals_snapshot["episode_ratings_submitted_today"]) > 0
+            or int(self.db_totals_snapshot["episode_ratings_last_submit_at"]) > 0
+            or int(self.queue_snapshot["episode_ratings_pending"]) > 0
+            or int(self.queue_snapshot["episode_ratings_in_flight"]) > 0
+            or int(self.queue_snapshot["episode_ratings_failed"]) > 0
+        )
+
         table = Table.grid(expand=True, padding=(0, 0))
         table.add_column(
             style="bold magenta",
@@ -5051,25 +5925,52 @@ class RuntimeDashboard:
         table.add_row(
             "Total local DB",
             (
-                f"t={self.db_totals_snapshot['titles_total']} "
-                f"r={self.db_totals_snapshot['ratings_total']} "
-                f"m={self.db_totals_snapshot['mappings_total']}"
+                (
+                    f"t={self.db_totals_snapshot['titles_total']} "
+                    f"r={self.db_totals_snapshot['ratings_total']} "
+                    f"e={self.db_totals_snapshot['episode_ratings_total']} "
+                    f"m={self.db_totals_snapshot['mappings_total']}"
+                )
+                if show_episode_metrics
+                else (
+                    f"t={self.db_totals_snapshot['titles_total']} "
+                    f"r={self.db_totals_snapshot['ratings_total']} "
+                    f"m={self.db_totals_snapshot['mappings_total']}"
+                )
             ),
         )
         table.add_row(
             "Total submitted",
             (
-                f"t={self.db_totals_snapshot['titles_submitted_total']} "
-                f"r={self.db_totals_snapshot['ratings_submitted_total']} "
-                f"m={self.db_totals_snapshot['mappings_submitted_total']}"
+                (
+                    f"t={self.db_totals_snapshot['titles_submitted_total']} "
+                    f"r={self.db_totals_snapshot['ratings_submitted_total']} "
+                    f"e={self.db_totals_snapshot['episode_ratings_submitted_total']} "
+                    f"m={self.db_totals_snapshot['mappings_submitted_total']}"
+                )
+                if show_episode_metrics
+                else (
+                    f"t={self.db_totals_snapshot['titles_submitted_total']} "
+                    f"r={self.db_totals_snapshot['ratings_submitted_total']} "
+                    f"m={self.db_totals_snapshot['mappings_submitted_total']}"
+                )
             ),
         )
         table.add_row(
             "Submitted today",
             (
-                f"t={self.db_totals_snapshot['titles_submitted_today']} "
-                f"r={self.db_totals_snapshot['ratings_submitted_today']} "
-                f"m={self.db_totals_snapshot['mappings_submitted_today']}"
+                (
+                    f"t={self.db_totals_snapshot['titles_submitted_today']} "
+                    f"r={self.db_totals_snapshot['ratings_submitted_today']} "
+                    f"e={self.db_totals_snapshot['episode_ratings_submitted_today']} "
+                    f"m={self.db_totals_snapshot['mappings_submitted_today']}"
+                )
+                if show_episode_metrics
+                else (
+                    f"t={self.db_totals_snapshot['titles_submitted_today']} "
+                    f"r={self.db_totals_snapshot['ratings_submitted_today']} "
+                    f"m={self.db_totals_snapshot['mappings_submitted_today']}"
+                )
             ),
         )
         table.add_row(
@@ -5082,10 +5983,27 @@ class RuntimeDashboard:
         table.add_row(
             "Submitter activity",
             (
-                f"ratings={self._format_iso(self.db_totals_snapshot['ratings_last_submit_at'])} "
-                f"mappings={self._format_iso(self.db_totals_snapshot['mappings_last_submit_at'])}"
+                (
+                    f"ratings={self._format_iso(self.db_totals_snapshot['ratings_last_submit_at'])} "
+                    f"episodes={self._format_iso(self.db_totals_snapshot['episode_ratings_last_submit_at'])} "
+                    f"mappings={self._format_iso(self.db_totals_snapshot['mappings_last_submit_at'])}"
+                )
+                if show_episode_metrics
+                else (
+                    f"ratings={self._format_iso(self.db_totals_snapshot['ratings_last_submit_at'])} "
+                    f"mappings={self._format_iso(self.db_totals_snapshot['mappings_last_submit_at'])}"
+                )
             ),
         )
+        if show_episode_metrics:
+            table.add_row(
+                "Episode mode",
+                (
+                    f"enabled={1 if self.episodes_enabled else 0} "
+                    f"titles={int(self.episode_daily_titles_used)}/{int(self.episode_daily_title_limit)} "
+                    f"remaining={int(self.episode_daily_titles_remaining)}"
+                ),
+            )
         table.add_row("MDBList limit", mdblist_line)
         table.add_row("Service TMDB", service_line("tmdb"))
         table.add_row("Service MDBList", service_line("mdblist"))
@@ -5180,6 +6098,9 @@ class Harvester:
             != IMDB_ARCHIVE_SOURCE_NAME
         ]
         self.imdb_archive_source: Optional[IMDbArchiveSource] = None
+        self.imdb_titles_enabled = False
+        self.imdb_episodes_enabled = False
+        self.imdb_episode_daily_title_limit = 0
         raw_imdb_path = str(config["runtime"].get("imdb_archive_path", "")).strip()
         if raw_imdb_path:
             imdb_path = Path(raw_imdb_path).expanduser()
@@ -5191,28 +6112,48 @@ class Harvester:
             name = str(entry.get("name", "")).strip().lower().lstrip("/")
             if name != IMDB_ARCHIVE_SOURCE_NAME or not bool(entry.get("enabled", True)):
                 continue
+            titles_enabled = bool(entry.get("titles_enabled", True))
+            episodes_enabled = bool(entry.get("episodes_enabled", False))
+            daily_episodes_title_limit = max(
+                1, int(entry.get("daily_episodes_title_limit", 1000))
+            )
             self.imdb_archive_source = IMDbArchiveSource(
                 name=IMDB_ARCHIVE_SOURCE_NAME,
+                titles_enabled=titles_enabled,
+                episodes_enabled=episodes_enabled,
+                daily_episodes_title_limit=daily_episodes_title_limit,
                 min_votes=max(0, int(entry.get("min_votes", 1000))),
                 types=tuple(entry.get("types") or list(DEFAULT_IMDB_TITLE_TYPES)),
                 exclude_unknown_year=bool(entry.get("exclude_unknown_year", True)),
                 max_titles_per_cycle=max(1, int(entry.get("max_titles_per_cycle", 10000))),
                 path=imdb_path,
             )
+            self.imdb_titles_enabled = titles_enabled
+            self.imdb_episodes_enabled = episodes_enabled
+            self.imdb_episode_daily_title_limit = daily_episodes_title_limit
             break
         self.scan_sources: List[Any] = list(self.tmdb_sources)
-        if self.imdb_archive_source is not None:
+        if self.imdb_archive_source is not None and self.imdb_titles_enabled:
             self.scan_sources.append(self.imdb_archive_source)
 
         self._imdb_index_path = (
             self.db.path.parent / "temp" / "imdb_archive_candidates_v1.tsv"
         )
         self._imdb_index_path.parent.mkdir(parents=True, exist_ok=True)
+        self._imdb_episode_index_path = (
+            self.db.path.parent / "temp" / "imdb_archive_episode_candidates_v1.tsv"
+        )
+        self._imdb_episode_index_path.parent.mkdir(parents=True, exist_ok=True)
         self._imdb_fingerprint_key = IMDB_ARCHIVE_FINGERPRINT_KEY
         self._imdb_cursor_line_key = IMDB_ARCHIVE_CURSOR_LINE_KEY
         self._imdb_cursor_byte_key = IMDB_ARCHIVE_CURSOR_BYTE_KEY
         self._imdb_total_key = IMDB_ARCHIVE_TOTAL_KEY
         self._imdb_exhausted_key = IMDB_ARCHIVE_EXHAUSTED_KEY
+        self._imdb_episode_fingerprint_key = IMDB_EPISODE_ARCHIVE_FINGERPRINT_KEY
+        self._imdb_episode_cursor_line_key = IMDB_EPISODE_ARCHIVE_CURSOR_LINE_KEY
+        self._imdb_episode_cursor_byte_key = IMDB_EPISODE_ARCHIVE_CURSOR_BYTE_KEY
+        self._imdb_episode_total_key = IMDB_EPISODE_ARCHIVE_TOTAL_KEY
+        self._imdb_episode_exhausted_key = IMDB_EPISODE_ARCHIVE_EXHAUSTED_KEY
         self._imdb_last_update_key = IMDB_ARCHIVE_LAST_UPDATE_KEY
         self._imdb_last_update_attempt_key = IMDB_ARCHIVE_LAST_UPDATE_ATTEMPT_KEY
         self._imdb_last_update_marker_path = imdb_path / ".imdb_archive_last_update_epoch"
@@ -5223,6 +6164,10 @@ class Harvester:
         if self.status is not None:
             self.status.set_discovery_mode(self.discovery_mode)
             self.status.update_local_stats(self._init_local_stats(local_day_key()))
+            self.status.set_episode_mode(
+                enabled=self.imdb_archive_source is not None and self.imdb_episodes_enabled,
+                daily_title_limit=self.imdb_episode_daily_title_limit,
+            )
 
     def close(self) -> None:
         self.imdb_cache.close()
@@ -5277,6 +6222,22 @@ class Harvester:
         self.db.set_state(self._imdb_cursor_line_key, max(0, int(cursor_line)))
         self.db.set_state(self._imdb_cursor_byte_key, max(0, int(cursor_byte)))
         self.db.set_state(self._imdb_exhausted_key, 1 if exhausted else 0)
+
+    def _reset_imdb_episode_cursor(self, *, exhausted: bool = False) -> None:
+        self.db.set_state(self._imdb_episode_cursor_line_key, 0)
+        self.db.set_state(self._imdb_episode_cursor_byte_key, 0)
+        self.db.set_state(self._imdb_episode_exhausted_key, 1 if exhausted else 0)
+
+    def _commit_imdb_episode_cursor(
+        self,
+        *,
+        cursor_line: int,
+        cursor_byte: int,
+        exhausted: bool,
+    ) -> None:
+        self.db.set_state(self._imdb_episode_cursor_line_key, max(0, int(cursor_line)))
+        self.db.set_state(self._imdb_episode_cursor_byte_key, max(0, int(cursor_byte)))
+        self.db.set_state(self._imdb_episode_exhausted_key, 1 if exhausted else 0)
 
     def _build_imdb_fingerprint(
         self,
@@ -5437,11 +6398,14 @@ class Harvester:
             return
 
         now_ts = now_epoch()
-        required_tsv_paths = [archive_dir / dataset for dataset in IMDB_ARCHIVE_DATASET_URLS]
+        dataset_urls: Dict[str, str] = dict(IMDB_ARCHIVE_DATASET_URLS)
+        if bool(source.episodes_enabled):
+            dataset_urls.update(IMDB_EPISODE_DATASET_URLS)
+        required_tsv_paths = [archive_dir / dataset for dataset in dataset_urls]
         missing_files = [path for path in required_tsv_paths if not path.exists()]
         extracted_from_local_gz = False
         if missing_files:
-            for dataset_name in IMDB_ARCHIVE_DATASET_URLS:
+            for dataset_name in dataset_urls:
                 extracted = self._extract_local_imdb_gz_if_needed(
                     dataset_name=dataset_name,
                     archive_dir=archive_dir,
@@ -5506,7 +6470,7 @@ class Harvester:
         staging: List[Tuple[Path, Path, str]] = []
         staged_paths: List[Path] = []
         try:
-            for dataset_name, url in IMDB_ARCHIVE_DATASET_URLS.items():
+            for dataset_name, url in dataset_urls.items():
                 tsv_final_path = archive_dir / dataset_name
                 tsv_tmp_path = archive_dir / f".{dataset_name}.download.tmp"
                 gz_tmp_path = archive_dir / f".{dataset_name}.gz.download.tmp"
@@ -5533,7 +6497,7 @@ class Harvester:
 
             for tsv_tmp_path, tsv_final_path, _dataset_name in staging:
                 tsv_tmp_path.replace(tsv_final_path)
-            for dataset_name in IMDB_ARCHIVE_DATASET_URLS:
+            for dataset_name in dataset_urls:
                 # Cleanup old compressed snapshots after successful refresh.
                 self._safe_unlink(archive_dir / f"{dataset_name}.gz")
 
@@ -5546,7 +6510,7 @@ class Harvester:
         except Exception as exc:
             for tmp_path in staged_paths:
                 self._safe_unlink(tmp_path)
-            for dataset_name in IMDB_ARCHIVE_DATASET_URLS:
+            for dataset_name in dataset_urls:
                 self._safe_unlink(archive_dir / f".{dataset_name}.download.tmp")
                 self._safe_unlink(archive_dir / f".{dataset_name}.gz.download.tmp")
 
@@ -5669,6 +6633,451 @@ class Harvester:
             ratings_path=ratings_path,
             basics_path=basics_path,
             fingerprint=fingerprint,
+        )
+
+    def _build_imdb_episode_fingerprint(
+        self,
+        source: IMDbArchiveSource,
+    ) -> Tuple[str, Path, Path, Path]:
+        ratings_path = source.path / "title.ratings.tsv"
+        basics_path = source.path / "title.basics.tsv"
+        episode_path = source.path / "title.episode.tsv"
+        if not ratings_path.exists():
+            raise FileNotFoundError(f"IMDb ratings file missing: {ratings_path}")
+        if not basics_path.exists():
+            raise FileNotFoundError(f"IMDb basics file missing: {basics_path}")
+        if not episode_path.exists():
+            raise FileNotFoundError(f"IMDb episode file missing: {episode_path}")
+
+        ratings_stat = ratings_path.stat()
+        basics_stat = basics_path.stat()
+        episode_stat = episode_path.stat()
+        payload = {
+            "ratings": {
+                "path": str(ratings_path.resolve()),
+                "size": int(ratings_stat.st_size),
+                "mtime_ns": int(ratings_stat.st_mtime_ns),
+            },
+            "basics": {
+                "path": str(basics_path.resolve()),
+                "size": int(basics_stat.st_size),
+                "mtime_ns": int(basics_stat.st_mtime_ns),
+            },
+            "episode": {
+                "path": str(episode_path.resolve()),
+                "size": int(episode_stat.st_size),
+                "mtime_ns": int(episode_stat.st_mtime_ns),
+            },
+            "index": {
+                "version": 2,
+                "order": "parent_votes_desc,season_asc,episode_asc",
+            },
+            "source": {
+                "min_votes": int(source.min_votes),
+                "daily_episodes_title_limit": int(source.daily_episodes_title_limit),
+                "max_titles_per_cycle": int(source.max_titles_per_cycle),
+            },
+        }
+        return (
+            json.dumps(payload, sort_keys=True, separators=(",", ":")),
+            episode_path,
+            ratings_path,
+            basics_path,
+        )
+
+    def _rebuild_imdb_episode_index(
+        self,
+        *,
+        source: IMDbArchiveSource,
+        episode_path: Path,
+        ratings_path: Path,
+        basics_path: Path,
+        fingerprint: str,
+    ) -> int:
+        started_at = now_epoch()
+        allowed_types = {str(x or "").strip().lower() for x in source.types}
+        allowed_parent_ids: Set[str] = set()
+        with basics_path.open("r", encoding="utf-8", errors="replace") as handle:
+            header = handle.readline().rstrip("\n").split("\t")
+            header_map = {name: idx for idx, name in enumerate(header)}
+            tconst_idx = header_map.get("tconst")
+            type_idx = header_map.get("titleType")
+            start_year_idx = header_map.get("startYear")
+            if tconst_idx is None or type_idx is None or start_year_idx is None:
+                raise ValueError("IMDb basics header is missing required columns")
+
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if max(tconst_idx, type_idx, start_year_idx) >= len(parts):
+                    continue
+                imdb_id = str(parts[tconst_idx]).strip()
+                if not is_valid_imdb_title_id(imdb_id):
+                    continue
+                title_type = str(parts[type_idx]).strip().lower()
+                if title_type not in allowed_types:
+                    continue
+                if source.exclude_unknown_year and str(parts[start_year_idx]).strip() == "\\N":
+                    continue
+                allowed_parent_ids.add(imdb_id)
+
+        ratings_lookup: Dict[str, Tuple[int, float]] = {}
+        with ratings_path.open("r", encoding="utf-8", errors="replace") as handle:
+            header = handle.readline().rstrip("\n").split("\t")
+            header_map = {name: idx for idx, name in enumerate(header)}
+            tconst_idx = header_map.get("tconst")
+            avg_idx = header_map.get("averageRating")
+            votes_idx = header_map.get("numVotes")
+            if tconst_idx is None or avg_idx is None or votes_idx is None:
+                raise ValueError("IMDb ratings header is missing required columns")
+
+            for raw_line in handle:
+                line = raw_line.rstrip("\n")
+                if not line:
+                    continue
+                parts = line.split("\t")
+                if max(tconst_idx, avg_idx, votes_idx) >= len(parts):
+                    continue
+                imdb_id = str(parts[tconst_idx]).strip()
+                if not is_valid_imdb_title_id(imdb_id):
+                    continue
+                votes = parse_int(parts[votes_idx])
+                if votes is None or votes < source.min_votes:
+                    continue
+                try:
+                    average_rating = float(str(parts[avg_idx]).strip())
+                except (TypeError, ValueError):
+                    continue
+                safe_score = clamp_0_100(average_rating * 10.0)
+                if safe_score is None:
+                    continue
+                ratings_lookup[imdb_id] = (int(votes), float(safe_score))
+
+        builder_path = self._imdb_episode_index_path.with_suffix(".build.sqlite3")
+        builder_wal_path = Path(f"{builder_path}-wal")
+        builder_shm_path = Path(f"{builder_path}-shm")
+        self._safe_unlink(builder_path)
+        self._safe_unlink(builder_wal_path)
+        self._safe_unlink(builder_shm_path)
+
+        total = 0
+        builder_conn = sqlite3.connect(builder_path)
+        try:
+            with builder_conn:
+                builder_conn.execute("PRAGMA journal_mode=OFF")
+                builder_conn.execute("PRAGMA synchronous=OFF")
+                builder_conn.execute("PRAGMA temp_store=MEMORY")
+                builder_conn.execute(
+                    """
+                    CREATE TABLE episode_candidates (
+                        parent_imdb_id TEXT NOT NULL,
+                        episode_imdb_id TEXT NOT NULL,
+                        season INTEGER NOT NULL,
+                        episode INTEGER NOT NULL,
+                        episode_votes INTEGER NOT NULL,
+                        score REAL NOT NULL,
+                        parent_votes INTEGER NOT NULL
+                    )
+                    """
+                )
+
+            insert_buffer: List[Tuple[str, str, int, int, int, float, int]] = []
+            insert_buffer_max = 5000
+            with episode_path.open("r", encoding="utf-8", errors="replace") as in_handle:
+                header = in_handle.readline().rstrip("\n").split("\t")
+                header_map = {name: idx for idx, name in enumerate(header)}
+                tconst_idx = header_map.get("tconst")
+                parent_idx = header_map.get("parentTconst")
+                season_idx = header_map.get("seasonNumber")
+                episode_idx = header_map.get("episodeNumber")
+                if (
+                    tconst_idx is None
+                    or parent_idx is None
+                    or season_idx is None
+                    or episode_idx is None
+                ):
+                    raise ValueError("IMDb episode header is missing required columns")
+
+                for raw_line in in_handle:
+                    line = raw_line.rstrip("\n")
+                    if not line:
+                        continue
+                    parts = line.split("\t")
+                    if max(tconst_idx, parent_idx, season_idx, episode_idx) >= len(parts):
+                        continue
+
+                    episode_imdb_id = str(parts[tconst_idx]).strip()
+                    parent_imdb_id = str(parts[parent_idx]).strip()
+                    season = parse_int(parts[season_idx])
+                    episode = parse_int(parts[episode_idx])
+                    if (
+                        not is_valid_imdb_title_id(episode_imdb_id)
+                        or not is_valid_imdb_title_id(parent_imdb_id)
+                        or season is None
+                        or episode is None
+                        or season < 1
+                        or episode < 1
+                        or parent_imdb_id not in allowed_parent_ids
+                    ):
+                        continue
+
+                    episode_rating = ratings_lookup.get(episode_imdb_id)
+                    parent_rating = ratings_lookup.get(parent_imdb_id)
+                    if episode_rating is None or parent_rating is None:
+                        continue
+
+                    episode_votes, episode_score = episode_rating
+                    parent_votes, _parent_score = parent_rating
+                    insert_buffer.append(
+                        (
+                            parent_imdb_id,
+                            episode_imdb_id,
+                            int(season),
+                            int(episode),
+                            int(episode_votes),
+                            float(episode_score),
+                            int(parent_votes),
+                        )
+                    )
+
+                    if len(insert_buffer) >= insert_buffer_max:
+                        with builder_conn:
+                            builder_conn.executemany(
+                                """
+                                INSERT INTO episode_candidates(
+                                    parent_imdb_id,
+                                    episode_imdb_id,
+                                    season,
+                                    episode,
+                                    episode_votes,
+                                    score,
+                                    parent_votes
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                                """,
+                                insert_buffer,
+                            )
+                        insert_buffer.clear()
+
+            if insert_buffer:
+                with builder_conn:
+                    builder_conn.executemany(
+                        """
+                        INSERT INTO episode_candidates(
+                            parent_imdb_id,
+                            episode_imdb_id,
+                            season,
+                            episode,
+                            episode_votes,
+                            score,
+                            parent_votes
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        insert_buffer,
+                    )
+
+            with self._imdb_episode_index_path.open("w", encoding="utf-8") as out_handle:
+                cursor = builder_conn.execute(
+                    """
+                    SELECT
+                        parent_imdb_id,
+                        episode_imdb_id,
+                        season,
+                        episode,
+                        episode_votes,
+                        score
+                    FROM episode_candidates
+                    ORDER BY
+                        parent_votes DESC,
+                        parent_imdb_id ASC,
+                        season ASC,
+                        episode ASC,
+                        episode_imdb_id ASC
+                    """
+                )
+                for row in cursor:
+                    out_handle.write(
+                        (
+                            f"{str(row[0]).strip()}\t{str(row[1]).strip()}\t"
+                            f"{int(row[2])}\t{int(row[3])}\t{int(row[4])}\t"
+                            f"{float(row[5]):.1f}\n"
+                        )
+                    )
+                    total += 1
+        finally:
+            builder_conn.close()
+            self._safe_unlink(builder_path)
+            self._safe_unlink(builder_wal_path)
+            self._safe_unlink(builder_shm_path)
+
+        self.db.set_state(self._imdb_episode_fingerprint_key, fingerprint)
+        self.db.set_state(self._imdb_episode_total_key, total)
+        self._reset_imdb_episode_cursor(exhausted=(total == 0))
+        elapsed = max(1, now_epoch() - started_at)
+        LOGGER.info(
+            "[IMDbArchive] Rebuilt episode index: rows=%s path=%s (%.1f rows/s)",
+            total,
+            self._imdb_episode_index_path,
+            total / elapsed if elapsed > 0 else 0.0,
+        )
+        return total
+
+    def _ensure_imdb_episode_index(self, source: IMDbArchiveSource) -> int:
+        self._refresh_imdb_archives_if_due(source)
+        fingerprint, episode_path, ratings_path, basics_path = (
+            self._build_imdb_episode_fingerprint(source)
+        )
+        existing_fingerprint = self.db.get_state(self._imdb_episode_fingerprint_key)
+        existing_total = max(0, self.db.get_state_int(self._imdb_episode_total_key, 0))
+        if (
+            existing_fingerprint == fingerprint
+            and self._imdb_episode_index_path.exists()
+            and existing_total >= 0
+        ):
+            return existing_total
+        return self._rebuild_imdb_episode_index(
+            source=source,
+            episode_path=episode_path,
+            ratings_path=ratings_path,
+            basics_path=basics_path,
+            fingerprint=fingerprint,
+        )
+
+    def _read_imdb_episode_index_batch(
+        self,
+        *,
+        source: IMDbArchiveSource,
+        day_key: str,
+    ) -> Tuple[
+        List[IMDbEpisodeArchiveCandidate],
+        int,
+        int,
+        bool,
+        Set[str],
+        bool,
+    ]:
+        if self.db.get_state_int(self._imdb_episode_exhausted_key, 0) == 1:
+            current_line = max(
+                0,
+                self.db.get_state_int(self._imdb_episode_cursor_line_key, 0),
+            )
+            current_byte = max(
+                0,
+                self.db.get_state_int(self._imdb_episode_cursor_byte_key, 0),
+            )
+            return [], current_line, current_byte, True, set(), False
+        if not self._imdb_episode_index_path.exists():
+            current_line = max(
+                0,
+                self.db.get_state_int(self._imdb_episode_cursor_line_key, 0),
+            )
+            current_byte = max(
+                0,
+                self.db.get_state_int(self._imdb_episode_cursor_byte_key, 0),
+            )
+            return [], current_line, current_byte, True, set(), False
+
+        cycle_title_limit = max(1, int(source.max_titles_per_cycle))
+        cursor_line = max(0, self.db.get_state_int(self._imdb_episode_cursor_line_key, 0))
+        cursor_byte = max(0, self.db.get_state_int(self._imdb_episode_cursor_byte_key, 0))
+        total_lines = max(0, self.db.get_state_int(self._imdb_episode_total_key, 0))
+        file_size = self._imdb_episode_index_path.stat().st_size
+        if cursor_byte > file_size:
+            cursor_byte = 0
+            cursor_line = 0
+
+        counted_titles = self.db.get_episode_daily_titles(day_key)
+        daily_remaining = max(
+            0,
+            int(source.daily_episodes_title_limit) - len(counted_titles),
+        )
+
+        batch: List[IMDbEpisodeArchiveCandidate] = []
+        lines_read = 0
+        eof_reached = False
+        daily_cap_hit = False
+        new_daily_titles: Set[str] = set()
+        cycle_titles_seen: Set[str] = set()
+        max_rows = max(1, cycle_title_limit * 250)
+
+        with self._imdb_episode_index_path.open("r", encoding="utf-8", errors="replace") as handle:
+            handle.seek(cursor_byte)
+            while len(batch) < max_rows:
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    eof_reached = True
+                    break
+                lines_read += 1
+                stripped = line.rstrip("\n")
+                if not stripped:
+                    continue
+                parts = stripped.split("\t")
+                if len(parts) < 6:
+                    continue
+
+                parent_imdb_id = str(parts[0]).strip()
+                episode_imdb_id = str(parts[1]).strip()
+                season = parse_int(parts[2])
+                episode = parse_int(parts[3])
+                votes = parse_int(parts[4])
+                try:
+                    score = float(parts[5])
+                except (TypeError, ValueError):
+                    score = -1.0
+
+                if (
+                    not is_valid_imdb_title_id(parent_imdb_id)
+                    or not is_valid_imdb_title_id(episode_imdb_id)
+                    or season is None
+                    or episode is None
+                    or season < 1
+                    or episode < 1
+                    or votes is None
+                    or votes < 0
+                    or clamp_0_100(score) is None
+                ):
+                    continue
+
+                if parent_imdb_id not in cycle_titles_seen:
+                    if len(cycle_titles_seen) >= cycle_title_limit:
+                        lines_read = max(0, lines_read - 1)
+                        handle.seek(line_start)
+                        break
+                    cycle_titles_seen.add(parent_imdb_id)
+
+                if parent_imdb_id not in counted_titles and parent_imdb_id not in new_daily_titles:
+                    if daily_remaining <= 0:
+                        lines_read = max(0, lines_read - 1)
+                        handle.seek(line_start)
+                        daily_cap_hit = True
+                        break
+                    new_daily_titles.add(parent_imdb_id)
+                    daily_remaining -= 1
+
+                batch.append(
+                    IMDbEpisodeArchiveCandidate(
+                        parent_imdb_id=parent_imdb_id,
+                        episode_imdb_id=episode_imdb_id,
+                        season=int(season),
+                        episode=int(episode),
+                        score=float(score),
+                        votes=int(votes),
+                    )
+                )
+
+            next_byte = handle.tell()
+
+        new_cursor_line = cursor_line + lines_read
+        exhausted = eof_reached or (total_lines > 0 and new_cursor_line >= total_lines)
+        return (
+            batch,
+            new_cursor_line,
+            next_byte,
+            exhausted,
+            new_daily_titles,
+            daily_cap_hit,
         )
 
     def _read_imdb_index_batch(
@@ -5985,6 +7394,215 @@ class Harvester:
                 errors=lookup_errors,
             )
         return mapped, lookup_errors, missing_mappings
+
+    async def _map_imdb_episode_parents_to_tmdb(
+        self,
+        *,
+        parent_ids: Sequence[str],
+        stop_event: asyncio.Event,
+    ) -> Tuple[Dict[str, Candidate], int, int]:
+        mapped: Dict[str, Candidate] = {}
+        lookup_errors = 0
+        missing_mappings = 0
+        queue: asyncio.Queue[str] = asyncio.Queue()
+        for parent_id in parent_ids:
+            normalized_parent = normalize_imdb_title_id(parent_id)
+            if normalized_parent:
+                queue.put_nowait(normalized_parent)
+
+        lock = asyncio.Lock()
+
+        async def worker() -> None:
+            nonlocal lookup_errors
+            nonlocal missing_mappings
+            while True:
+                if stop_event.is_set():
+                    return
+                try:
+                    parent_id = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                try:
+                    local_candidate = self._resolve_imdb_to_tmdb_local(
+                        imdb_id=parent_id,
+                        media_type="tv",
+                    )
+                    if local_candidate is not None:
+                        async with lock:
+                            mapped[parent_id] = local_candidate
+                        continue
+
+                    response = await self.tmdb_client.fetch_find_by_imdb(parent_id)
+                    if not response.ok or not isinstance(response.data, dict):
+                        async with lock:
+                            lookup_errors += 1
+                        continue
+                    tmdb_id, title, popularity = self._extract_tmdb_from_find_payload(
+                        response.data,
+                        "tv",
+                    )
+                    if tmdb_id is None:
+                        async with lock:
+                            missing_mappings += 1
+                        continue
+                    candidate = Candidate(
+                        tmdb_id=tmdb_id,
+                        media_type="tv",
+                        title=title or f"TMDB-{tmdb_id}",
+                        popularity=popularity,
+                    )
+                    async with lock:
+                        mapped[parent_id] = candidate
+                        self.imdb_cache.upsert(
+                            imdb_id=parent_id,
+                            media_type="tv",
+                            tmdb_id=tmdb_id,
+                            title=candidate.title,
+                            popularity=candidate.popularity,
+                            updated_at=now_epoch(),
+                        )
+                finally:
+                    queue.task_done()
+
+        worker_count = max(1, min(self.details_concurrency, len(parent_ids)))
+        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
+        await asyncio.gather(*workers)
+        return mapped, lookup_errors, missing_mappings
+
+    async def _run_imdb_episode_cycle(self, stop_event: asyncio.Event) -> Dict[str, int]:
+        stats: Dict[str, int] = {
+            "enabled": 1 if (self.imdb_archive_source is not None and self.imdb_episodes_enabled) else 0,
+            "daily_titles_used": 0,
+            "daily_titles_remaining": 0,
+            "rows_selected": 0,
+            "titles_selected": 0,
+            "titles_mapped": 0,
+            "titles_missing": 0,
+            "lookup_errors": 0,
+            "rows_queued": 0,
+            "queue_total": 0,
+            "exhausted": 0,
+            "daily_capped": 0,
+        }
+        if self.imdb_archive_source is None or not self.imdb_episodes_enabled:
+            if self.status is not None:
+                self.status.update_episode_cycle_stats(stats)
+            return stats
+
+        source = self.imdb_archive_source
+        day_key = local_day_key()
+        daily_used = self.db.get_episode_daily_title_count(day_key)
+        daily_limit = max(1, int(source.daily_episodes_title_limit))
+        stats["daily_titles_used"] = int(daily_used)
+        stats["daily_titles_remaining"] = max(0, daily_limit - daily_used)
+        if daily_used >= daily_limit:
+            stats["daily_capped"] = 1
+            queue_counts = self.db.queue_counts()
+            stats["queue_total"] = int(queue_counts["episode_ratings_pending"])
+            if self.status is not None:
+                self.status.update_episode_cycle_stats(stats)
+            return stats
+
+        try:
+            self._ensure_imdb_episode_index(source)
+        except Exception as exc:
+            LOGGER.warning("[IMDbArchive] episode index unavailable: %s", exc)
+            stats["lookup_errors"] = 1
+            queue_counts = self.db.queue_counts()
+            stats["queue_total"] = int(queue_counts["episode_ratings_pending"])
+            if self.status is not None:
+                self.status.update_episode_cycle_stats(stats)
+            return stats
+
+        (
+            batch,
+            next_cursor_line,
+            next_cursor_byte,
+            exhausted,
+            new_daily_titles,
+            daily_cap_hit,
+        ) = self._read_imdb_episode_index_batch(
+            source=source,
+            day_key=day_key,
+        )
+        stats["rows_selected"] = len(batch)
+        stats["titles_selected"] = len({entry.parent_imdb_id for entry in batch})
+        stats["exhausted"] = 1 if exhausted else 0
+        stats["daily_capped"] = 1 if daily_cap_hit else 0
+
+        if stop_event.is_set():
+            if self.status is not None:
+                self.status.update_episode_cycle_stats(stats)
+            return stats
+
+        rows_queued = 0
+        if batch:
+            parent_ids = sorted({entry.parent_imdb_id for entry in batch})
+            mapped_parents, lookup_errors, missing_mappings = (
+                await self._map_imdb_episode_parents_to_tmdb(
+                    parent_ids=parent_ids,
+                    stop_event=stop_event,
+                )
+            )
+            stats["titles_mapped"] = len(mapped_parents)
+            stats["titles_missing"] = int(missing_mappings)
+            stats["lookup_errors"] = int(lookup_errors)
+
+            grouped_entries: Dict[str, List[IMDbEpisodeArchiveCandidate]] = defaultdict(list)
+            for entry in batch:
+                grouped_entries[entry.parent_imdb_id].append(entry)
+
+            now_ts = now_epoch()
+            for parent_id, entries in grouped_entries.items():
+                if stop_event.is_set():
+                    break
+                mapped_candidate = mapped_parents.get(parent_id)
+                if mapped_candidate is None:
+                    continue
+                rows_queued += self.db.save_imdb_episode_ratings(
+                    tmdb_id=mapped_candidate.tmdb_id,
+                    media_type=mapped_candidate.media_type,
+                    imdb_parent_id=parent_id,
+                    entries=entries,
+                    now_ts=now_ts,
+                    default_label="overall",
+                )
+
+        stats["rows_queued"] = int(rows_queued)
+
+        if not stop_event.is_set():
+            self._commit_imdb_episode_cursor(
+                cursor_line=next_cursor_line,
+                cursor_byte=next_cursor_byte,
+                exhausted=exhausted,
+            )
+            if new_daily_titles:
+                self.db.add_episode_daily_titles(day_key, new_daily_titles)
+
+        daily_used_after = self.db.get_episode_daily_title_count(day_key)
+        stats["daily_titles_used"] = int(daily_used_after)
+        stats["daily_titles_remaining"] = max(0, daily_limit - daily_used_after)
+        queue_counts = self.db.queue_counts()
+        stats["queue_total"] = int(queue_counts["episode_ratings_pending"])
+
+        if self.status is not None:
+            self.status.update_episode_cycle_stats(stats)
+
+        if batch:
+            LOGGER.info(
+                "[IMDbArchive] Episode cycle: rows=%s titles=%s mapped=%s queued=%s missing=%s errors=%s daily=%s/%s capped=%s exhausted=%s",
+                len(batch),
+                len({entry.parent_imdb_id for entry in batch}),
+                int(stats["titles_mapped"]),
+                int(stats["rows_queued"]),
+                int(stats["titles_missing"]),
+                int(stats["lookup_errors"]),
+                int(stats["daily_titles_used"]),
+                int(daily_limit),
+                int(stats["daily_capped"]),
+                int(stats["exhausted"]),
+            )
+        return stats
 
     @staticmethod
     def _serialize_candidate(candidate: Candidate) -> Dict[str, Any]:
@@ -6304,7 +7922,7 @@ class Harvester:
         now_ts = now_epoch()
         cycle_started_ts = now_ts
         configured_target_pages = sum(source.max_pages for source in self.tmdb_sources)
-        if self.imdb_archive_source is not None:
+        if self.imdb_archive_source is not None and self.imdb_titles_enabled:
             configured_target_pages += self.imdb_archive_source.max_pages
         effective_target_pages = configured_target_pages
         pages_scanned = 0
@@ -6508,7 +8126,12 @@ class Harvester:
             if cap_reached:
                 break
 
-        if not interrupted and not cap_reached and self.imdb_archive_source is not None:
+        if (
+            not interrupted
+            and not cap_reached
+            and self.imdb_archive_source is not None
+            and self.imdb_titles_enabled
+        ):
             source = self.imdb_archive_source
             stat = source_stats[source.name]
             pages_scanned += 1
@@ -6794,6 +8417,21 @@ class Harvester:
         if self.status is not None:
             self.status.set_discovery_mode(self.discovery_mode)
             self.status.update_local_stats(local_stats)
+            self.status.set_episode_mode(
+                enabled=self.imdb_archive_source is not None and self.imdb_episodes_enabled,
+                daily_title_limit=self.imdb_episode_daily_title_limit,
+            )
+
+        await self._run_imdb_episode_cycle(stop_event)
+        if stop_event.is_set():
+            LOGGER.info("[Harvester] Stop requested during IMDb episode cycle.")
+            return HarvestCycleResult(
+                selected_candidates=0,
+                tmdb_list_request_errors=0,
+                mdblist_request_failures=0,
+                interrupted=True,
+                resumed_from_checkpoint=False,
+            )
 
         def merge_unique_candidates(*groups: Sequence[Candidate]) -> List[Candidate]:
             merged: List[Candidate] = []
@@ -7557,10 +9195,15 @@ class Submitter:
                 pass
 
             recovered = self.db.recover_stale_in_flight_rows(self.in_flight_lease_seconds)
-            if recovered["ratings"] > 0 or recovered["mappings"] > 0:
+            if (
+                recovered["ratings"] > 0
+                or recovered["episode_ratings"] > 0
+                or recovered["mappings"] > 0
+            ):
                 LOGGER.warning(
-                    "[Submitter] Recovered stale in_flight rows (ratings=%s mappings=%s, lease=%ss).",
+                    "[Submitter] Recovered stale in_flight rows (ratings=%s episode_ratings=%s mappings=%s, lease=%ss).",
                     recovered["ratings"],
+                    recovered["episode_ratings"],
                     recovered["mappings"],
                     self.in_flight_lease_seconds,
                 )
@@ -7580,6 +9223,15 @@ class Submitter:
             if rating_row is not None:
                 did_work = True
                 await self._submit_rating(rating_row)
+
+            now_ts = now_epoch()
+            episode_rows = self.db.claim_next_pending_episode_ratings_batch(
+                now_ts=now_ts,
+                batch_size=50,
+            )
+            if episode_rows:
+                did_work = True
+                await self._submit_episode_ratings_batch(episode_rows)
 
             if not did_work:
                 try:
@@ -7896,6 +9548,315 @@ class Submitter:
             label,
             score,
             result.error_text[:200],
+        )
+
+    async def _submit_episode_ratings_batch(self, rows: Sequence[sqlite3.Row]) -> None:
+        if not rows:
+            return
+
+        first = rows[0]
+        tmdb_id = int(first["tmdb_id"])
+        media_type = str(first["media_type"])
+        season = int(first["season"])
+        label = str(first["label"])
+        endpoint = "/api/external/episode-ratings/batch"
+        rows_to_create: List[sqlite3.Row] = []
+
+        for row in rows:
+            episode = int(row["episode"])
+            item_id = first_non_empty(row["pmdb_item_id"])
+            if not item_id:
+                rows_to_create.append(row)
+                continue
+            delete_result = await self.pmdb_client.delete_episode_rating_by_id(item_id)
+            if delete_result.success:
+                rows_to_create.append(row)
+                continue
+
+            message = delete_result.error_text or "Failed to delete existing episode rating"
+            if delete_result.retryable:
+                attempts = int(row["pmdb_attempts"] or 0)
+                pseudo_result = PMDBSubmitResult(
+                    success=False,
+                    retryable=True,
+                    retry_after_seconds=max(5, int(delete_result.retry_after_seconds or 30)),
+                    duplicate_or_exists=False,
+                    error_text=message,
+                    item_id=None,
+                    status_code=int(delete_result.status_code or 0),
+                    error_code=delete_result.error_code or "delete_failed",
+                    endpoint=delete_result.endpoint or endpoint,
+                )
+                if attempts + 1 >= self.max_retry_attempts:
+                    self.db.mark_episode_rating_failed(
+                        tmdb_id,
+                        media_type,
+                        season,
+                        episode,
+                        label,
+                        self._format_manual_error(
+                            endpoint=delete_result.endpoint or endpoint,
+                            status=int(delete_result.status_code or 0),
+                            code="max_retry_attempts_exceeded",
+                            retryable=False,
+                            message=(
+                                f"Exceeded max retry attempts ({self.max_retry_attempts}) "
+                                "for episode rating delete+create."
+                            ),
+                        ),
+                    )
+                    if self.status is not None:
+                        self.status.record_submit_result(
+                            kind="episode_rating",
+                            outcome="failed",
+                            error_text=message,
+                        )
+                else:
+                    retry_delay = self._retry_delay_seconds(pseudo_result, attempts)
+                    retry_at = now_epoch() + retry_delay
+                    self.db.mark_episode_rating_retry(
+                        tmdb_id,
+                        media_type,
+                        season,
+                        episode,
+                        label,
+                        retry_at,
+                        self._format_manual_error(
+                            endpoint=delete_result.endpoint or endpoint,
+                            status=int(delete_result.status_code or 0),
+                            code=delete_result.error_code or "delete_failed",
+                            retryable=True,
+                            message=message,
+                        ),
+                    )
+                    if self.status is not None:
+                        self.status.record_submit_result(
+                            kind="episode_rating",
+                            outcome="retry",
+                            error_text=message,
+                        )
+                continue
+
+            self.db.mark_episode_rating_failed(
+                tmdb_id,
+                media_type,
+                season,
+                episode,
+                label,
+                self._format_manual_error(
+                    endpoint=delete_result.endpoint or endpoint,
+                    status=int(delete_result.status_code or 0),
+                    code=delete_result.error_code or "delete_failed",
+                    retryable=False,
+                    message=message,
+                ),
+            )
+            if self.status is not None:
+                self.status.record_submit_result(
+                    kind="episode_rating",
+                    outcome="failed",
+                    error_text=message,
+                )
+
+        if not rows_to_create:
+            return
+
+        payload_ratings: List[Dict[str, Any]] = []
+        for row in rows_to_create:
+            payload_ratings.append(
+                {
+                    "episode": int(row["episode"]),
+                    "score": float(row["score"]),
+                    "label": str(row["label"]),
+                }
+            )
+
+        response = await self.pmdb_client.submit_episode_ratings_batch(
+            tmdb_id=tmdb_id,
+            media_type=media_type,
+            season=season,
+            label=label,
+            ratings=payload_ratings,
+        )
+
+        payload = response.data if isinstance(response.data, dict) else {}
+        created_items: Dict[int, Optional[str]] = {}
+        items = payload.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item_episode = parse_int(item.get("episode"))
+                if item_episode is None:
+                    continue
+                created_items[int(item_episode)] = first_non_empty(item.get("id"))
+
+        unresolved_rows: List[sqlite3.Row] = []
+        submitted_at = now_epoch()
+        for row in rows_to_create:
+            episode = int(row["episode"])
+            created_item_id = created_items.get(episode)
+            if episode in created_items:
+                self.db.mark_episode_rating_submitted(
+                    tmdb_id,
+                    media_type,
+                    season,
+                    episode,
+                    str(row["label"]),
+                    submitted_at,
+                    pmdb_item_id=created_item_id,
+                )
+                if self.status is not None:
+                    self.status.record_submit_result(kind="episode_rating", outcome="success")
+            else:
+                unresolved_rows.append(row)
+
+        for row in list(unresolved_rows):
+            episode = int(row["episode"])
+            score = float(row["score"])
+            found_existing, found_item_id = await self.pmdb_client.confirm_episode_rating_exists(
+                tmdb_id=tmdb_id,
+                media_type=media_type,
+                season=season,
+                episode=episode,
+                label=str(row["label"]),
+                score=score,
+            )
+            if not found_existing:
+                continue
+            self.db.mark_episode_rating_submitted(
+                tmdb_id,
+                media_type,
+                season,
+                episode,
+                str(row["label"]),
+                submitted_at,
+                pmdb_item_id=found_item_id,
+            )
+            if self.status is not None:
+                self.status.record_submit_result(kind="episode_rating", outcome="success")
+            unresolved_rows.remove(row)
+
+        if not unresolved_rows:
+            LOGGER.debug(
+                "[Submitter] Episode batch submitted: %s %s season=%s items=%s",
+                media_type,
+                tmdb_id,
+                season,
+                len(rows_to_create),
+            )
+            return
+
+        status_code = int(response.status or 0)
+        retryable = status_code in {0, 401, 429, 500, 502, 503, 504, 207}
+        error_code = PMDBClient._extract_error_code(response.data, response.text or "")
+        base_retry_after = (
+            parse_retry_after(response.headers.get("retry-after"), 30)
+            if status_code == 429
+            else 30
+        )
+
+        for row in unresolved_rows:
+            episode = int(row["episode"])
+            attempts = int(row["pmdb_attempts"] or 0)
+            score = float(row["score"])
+            label_value = str(row["label"])
+            message = (
+                response.text
+                or f"Episode batch submit unresolved for episode {episode}"
+            )
+            if retryable:
+                pseudo_result = PMDBSubmitResult(
+                    success=False,
+                    retryable=True,
+                    retry_after_seconds=base_retry_after,
+                    duplicate_or_exists=False,
+                    error_text=message,
+                    item_id=None,
+                    status_code=status_code,
+                    error_code=error_code,
+                    endpoint=endpoint,
+                )
+                if attempts + 1 >= self.max_retry_attempts:
+                    self.db.mark_episode_rating_failed(
+                        tmdb_id,
+                        media_type,
+                        season,
+                        episode,
+                        label_value,
+                        self._format_manual_error(
+                            endpoint=endpoint,
+                            status=status_code,
+                            code="max_retry_attempts_exceeded",
+                            retryable=False,
+                            message=(
+                                f"Exceeded max retry attempts ({self.max_retry_attempts}) "
+                                "for episode batch submission."
+                            ),
+                        ),
+                    )
+                    if self.status is not None:
+                        self.status.record_submit_result(
+                            kind="episode_rating",
+                            outcome="failed",
+                            error_text=message,
+                        )
+                else:
+                    retry_delay = self._retry_delay_seconds(pseudo_result, attempts)
+                    retry_at = now_epoch() + retry_delay
+                    self.db.mark_episode_rating_retry(
+                        tmdb_id,
+                        media_type,
+                        season,
+                        episode,
+                        label_value,
+                        retry_at,
+                        self._format_manual_error(
+                            endpoint=endpoint,
+                            status=status_code,
+                            code=error_code or "batch_unresolved",
+                            retryable=True,
+                            message=(
+                                f"{message[:220]} episode={episode} score={score:.1f}"
+                            ),
+                        ),
+                    )
+                    if self.status is not None:
+                        self.status.record_submit_result(
+                            kind="episode_rating",
+                            outcome="retry",
+                            error_text=message,
+                        )
+                continue
+
+            self.db.mark_episode_rating_failed(
+                tmdb_id,
+                media_type,
+                season,
+                episode,
+                label_value,
+                self._format_manual_error(
+                    endpoint=endpoint,
+                    status=status_code,
+                    code=error_code or "batch_failed",
+                    retryable=False,
+                    message=f"{message[:220]} episode={episode} score={score:.1f}",
+                ),
+            )
+            if self.status is not None:
+                self.status.record_submit_result(
+                    kind="episode_rating",
+                    outcome="failed",
+                    error_text=message,
+                )
+
+        LOGGER.warning(
+            "[Submitter] Episode batch unresolved: %s %s season=%s unresolved=%s status=%s",
+            media_type,
+            tmdb_id,
+            season,
+            len(unresolved_rows),
+            status_code,
         )
 
 
